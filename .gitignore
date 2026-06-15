@@ -1,0 +1,5 @@
+.python-version
+.vscode
+checkpoints
+wandb
+.DS_Store
