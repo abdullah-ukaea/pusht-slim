@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
+import torchvision.models as models
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import gymnasium as gym
 import gym_pusht  
@@ -20,10 +21,11 @@ DATASET_ID = "lerobot/pusht"
 N_HEADS = 4
 N_LAYERS = 2
 HIDDEN_DIM = 128
+COND_DIM = HIDDEN_DIM * (2 * N_OBS + 1)
 N_EPOCHS = 150
 LR = 1e-4
 SAVE_EVERY = 50
-EVAL_EVERY = 1
+EVAL_EVERY = 5
 CHECKPOINT_DIR = "checkpoints"
 BATCH_SIZE = 64
 
@@ -32,7 +34,6 @@ BATCH_SIZE = 64
 # so it lives at the same scale as the Gaussian noise used by flow matching,
 # then unnormalize the model's output before sending it back to the env.
 COORD_MIN, COORD_MAX = 0.0, 512.0
-
 
 def normalize(x):
     return 2.0 * (x - COORD_MIN) / (COORD_MAX - COORD_MIN) - 1.0
@@ -45,7 +46,7 @@ def unnormalize(x):
 # =============================================================================
 # 1. Environment
 # =============================================================================
-def evaluate(policy, device, n_episodes=10, render=False):
+def evaluate(policy, device, n_episodes=10, render=False, n_steps=10):
     render_mode = "human" if render else "rgb_array"
     env = gym.make(
         "gym_pusht/PushT-v0", obs_type="pixels_agent_pos", render_mode=render_mode
@@ -71,7 +72,7 @@ def evaluate(policy, device, n_episodes=10, render=False):
             states_in = states_buf.unsqueeze(0).to(device)  # (1, n_obs, 2)
 
             # generate a chunk of actions (in normalized [-1, 1] space)
-            actions = policy.inference(images_in, states_in)  # (1, n_actions, 2)
+            actions = policy.inference(images_in, states_in, n_steps=n_steps)  # (1, n_actions, 2)
             # back to the env's [0, 512] coordinate space
             actions = unnormalize(actions).squeeze(0).cpu().numpy()  # (n_actions, 2)
 
@@ -186,25 +187,32 @@ class PushTDataset(Dataset):
 class ImageEncoder(nn.Module):
     def __init__(self, out_dim):
         super().__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3),
-            nn.MaxPool2d(kernel_size=2),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3),
-            nn.MaxPool2d(kernel_size=2),
-            nn.ReLU(),
-            nn.Flatten(),
+        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+
+        resnet.conv1 = nn.Conv2d(
+            3, 64, kernel_size=3, stride=1, padding=1, bias=False
         )
-        self.fc = nn.Linear(15488, out_dim)
+
+        resnet.maxpool = nn.Identity()
+
+        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
+        
+        self.fc = nn.Linear(512, out_dim)
 
     def forward(self, images):
         # images: (batch, n_obs, 3, 96, 96)
         b, n, c, h, w = images.shape
         images = images.view(b * n, c, h, w)  
-        x = self.cnn(images)
+
+        mean = torch.tensor([0.485, 0.456, 0.406], device=images.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=images.device).view(1, 3, 1, 1)
+        images = (images - mean) / std
+        
+        x = self.backbone(images)
+        x = x.flatten(1) 
         x = self.fc(x)
         x = x.view(b, n, -1)  # (batch, n_obs, out_dim)
-        return x.mean(dim=1)  # average over the observation frames
+        return x.reshape(b, n * x.shape[-1]) 
 
 
 class StateEncoder(nn.Module):
@@ -220,7 +228,7 @@ class StateEncoder(nn.Module):
         states = state.view(b * n, s)
         x = self.mlp(states)
         x = x.view(b, n, -1)
-        return x.mean(dim=1)
+        return x.reshape(b, n * x.shape[-1]) 
 
 
 # turns the scalar flow-time t into a vector "fingerprint" the network can use,
@@ -246,23 +254,23 @@ class AdaLNBlock(nn.Module):
     def __init__(self, hidden_dim, n_heads):
         super().__init__()
         # turns the conditioning vector into scale1, shift1, alpha1, scale2, shift2, alpha2
-        self.adaLN_modulation = nn.Linear(hidden_dim * 3, hidden_dim * 6)
+        self.adaLN_modulation = nn.Linear(hidden_dim, hidden_dim * 6)
 
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.attention = nn.MultiheadAttention(hidden_dim, n_heads, batch_first=True)
+
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
             nn.GELU(),
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
 
-        # zero-init the modulation so each block starts as an identity function
         nn.init.zeros_(self.adaLN_modulation.weight)
         nn.init.zeros_(self.adaLN_modulation.bias)
 
     def forward(self, x, cond):
-        # x: (batch, n_actions, hidden_dim), cond: (batch, hidden_dim * 3)
+        # x: (batch, n_actions, hidden_dim), cond: (batch, hidden_dim)
         scale1, shift1, alpha1, scale2, shift2, alpha2 = self.adaLN_modulation(
             cond
         ).chunk(6, dim=-1)
@@ -281,7 +289,7 @@ class AdaLNBlock(nn.Module):
 
 
 class DiTPolicy(nn.Module):
-    def __init__(self, hidden_dim=HIDDEN_DIM, n_heads=N_HEADS, n_layers=N_LAYERS):
+    def __init__(self, hidden_dim=HIDDEN_DIM, cond_dim = COND_DIM, n_heads=N_HEADS, n_layers=N_LAYERS, n_actions=N_ACTIONS):
         super().__init__()
         self.image_encoder = ImageEncoder(out_dim=hidden_dim)
         self.timestep_encoder = TimestepEncoder(out_dim=hidden_dim)
@@ -289,6 +297,14 @@ class DiTPolicy(nn.Module):
 
         self.action_proj = nn.Linear(2, hidden_dim)
         self.action_out = nn.Linear(hidden_dim, 2)
+
+        self.action_pos_emb = nn.Parameter(torch.zeros(1, n_actions, hidden_dim))
+
+        self.cond_proj = nn.Sequential(
+            nn.Linear(cond_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
 
         self.blocks = nn.ModuleList(
             [
@@ -305,26 +321,26 @@ class DiTPolicy(nn.Module):
         obs_cond = self.state_encoder(obs)
         timestep_cond = self.timestep_encoder(t)
         cond = torch.cat([images_cond, obs_cond, timestep_cond], dim=-1)
+        cond = self.cond_proj(cond)
 
         x = self.action_proj(x_t)
+        x = x + self.action_pos_emb
+        
         for block in self.blocks:
             x = block(x, cond)
         return self.action_out(x)
 
     def training_step(self, images, obs, actions):
-        # corrupt the clean actions to a random point on the noise->action line,
-        # then learn to predict that line's (constant) velocity
         t = torch.rand(actions.shape[0]).to(actions.device)
         noise = torch.randn_like(actions)
         x_t = (1 - t[:, None, None]) * noise + t[:, None, None] * actions
 
         v_pred = self.forward(x_t, t, images, obs)
-        target = actions - noise  # true velocity of the straight path
+        target = actions - noise  
         return torch.nn.functional.mse_loss(v_pred, target)
 
     @torch.no_grad()
     def inference(self, images, obs, n_steps=10):
-        # start from pure noise and follow the predicted velocity field to t=1
         batch_size = images.shape[0]
         x = torch.randn(batch_size, N_ACTIONS, 2).to(images.device)
 
@@ -333,7 +349,7 @@ class DiTPolicy(nn.Module):
             t = torch.full((batch_size,), i / n_steps).to(images.device)
             v = self.forward(x, t, images, obs)
             x = x + v * dt
-        return x  # normalized actions in [-1, 1]
+        return x.clamp(-1.0, 1.0) 
 
 
 # =============================================================================
@@ -355,7 +371,7 @@ def train(
     )
     print(f"Training on {device}")
     policy = policy.to(device)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     for epoch in range(n_epochs):
@@ -379,11 +395,15 @@ def train(
         print(f"epoch {epoch}: avg_loss={avg_loss:.4f}")
 
         if epoch % eval_every == 0 or epoch == n_epochs - 1:
-            success_rate = evaluate(policy, device)
-            log_dict["success_rate"] = success_rate
-            print(f"epoch {epoch}: success_rate={success_rate:.2f}")
+            for n_steps in [1, 2, 5, 10, 20, 50]:
+                success_rate = evaluate(policy, device, n_episodes=20, n_steps=n_steps)
+                log_dict[f"success_rate/n_steps_{n_steps}"] = success_rate
+                print(
+                    f"epoch {epoch}: n_steps={n_steps}, "
+                    f"success_rate={success_rate:.2f}"
+                )
 
-        wandb.log(log_dict)
+        wandb.log(log_dict, step=epoch)
 
         if epoch % save_every == 0 or epoch == n_epochs - 1:
             checkpoint_path = os.path.join(
