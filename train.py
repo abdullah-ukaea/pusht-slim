@@ -14,18 +14,21 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import gymnasium as gym
 import gym_pusht  
 
-N_OBS = 2
+N_OBS = 1
 N_ACTIONS = 16
-N_ACTION_STEPS = 8  
+N_ACTION_STEPS = 8
 DATASET_ID = "lerobot/pusht"
-N_HEADS = 4
-N_LAYERS = 2
-HIDDEN_DIM = 128
+# DiT sized to ~47.5M (matching lerobot's DiT backbone): hidden 600, 6 layers, 8 heads
+N_HEADS = 8
+N_LAYERS = 6
+HIDDEN_DIM = 600
 COND_DIM = HIDDEN_DIM * (2 * N_OBS + 1)
-N_EPOCHS = 150
+BACKBONE = "resnet34"
+TOTAL_STEPS = 200_000
 LR = 1e-4
-SAVE_EVERY = 50
-EVAL_EVERY = 5
+LOG_EVERY = 200
+EVAL_EVERY = 10_000
+SAVE_EVERY = 10_000
 CHECKPOINT_DIR = "checkpoints"
 BATCH_SIZE = 64
 
@@ -184,10 +187,17 @@ class PushTDataset(Dataset):
 # =============================================================================
 # 3. Model
 # =============================================================================
+_RESNETS = {
+    "resnet18": (models.resnet18, models.ResNet18_Weights.DEFAULT),
+    "resnet34": (models.resnet34, models.ResNet34_Weights.DEFAULT),
+}
+
+
 class ImageEncoder(nn.Module):
-    def __init__(self, out_dim):
+    def __init__(self, out_dim, backbone="resnet18"):
         super().__init__()
-        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        ctor, weights = _RESNETS[backbone]
+        resnet = ctor(weights=weights)
 
         resnet.conv1 = nn.Conv2d(
             3, 64, kernel_size=3, stride=1, padding=1, bias=False
@@ -195,9 +205,10 @@ class ImageEncoder(nn.Module):
 
         resnet.maxpool = nn.Identity()
 
+        feat_dim = resnet.fc.in_features  # 512 for resnet18/34
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
-        
-        self.fc = nn.Linear(512, out_dim)
+
+        self.fc = nn.Linear(feat_dim, out_dim)
 
     def forward(self, images):
         # images: (batch, n_obs, 3, 96, 96)
@@ -289,9 +300,12 @@ class AdaLNBlock(nn.Module):
 
 
 class DiTPolicy(nn.Module):
-    def __init__(self, hidden_dim=HIDDEN_DIM, cond_dim = COND_DIM, n_heads=N_HEADS, n_layers=N_LAYERS, n_actions=N_ACTIONS):
+    def __init__(self, hidden_dim=HIDDEN_DIM, cond_dim=None, n_heads=N_HEADS, n_layers=N_LAYERS, n_actions=N_ACTIONS, backbone=BACKBONE):
         super().__init__()
-        self.image_encoder = ImageEncoder(out_dim=hidden_dim)
+        # conditioning = image + state (each n_obs frames) + timestep, all hidden_dim wide
+        if cond_dim is None:
+            cond_dim = hidden_dim * (2 * N_OBS + 1)
+        self.image_encoder = ImageEncoder(out_dim=hidden_dim, backbone=backbone)
         self.timestep_encoder = TimestepEncoder(out_dim=hidden_dim)
         self.state_encoder = StateEncoder(out_dim=hidden_dim)
 
@@ -355,13 +369,37 @@ class DiTPolicy(nn.Module):
 # =============================================================================
 # 4. Training
 # =============================================================================
+def run_eval(policy, device, global_step):
+    eval_dict = {}
+    for n_steps in [1, 2, 5, 10, 20, 50]:
+        success_rate = evaluate(policy, device, n_episodes=20, n_steps=n_steps)
+        eval_dict[f"success_rate/n_steps_{n_steps}"] = success_rate
+        print(f"step {global_step}: n_steps={n_steps}, success_rate={success_rate:.2f}")
+    return eval_dict
+
+
+def save_checkpoint(policy, optimizer, global_step, loss, checkpoint_dir):
+    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{global_step}.pt")
+    torch.save(
+        {
+            "step": global_step,
+            "model_state_dict": policy.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "loss": loss,
+        },
+        checkpoint_path,
+    )
+    print(f"Saved checkpoint to {checkpoint_path}")
+
+
 def train(
     policy,
     dataloader,
-    n_epochs=N_EPOCHS,
+    total_steps=TOTAL_STEPS,
     lr=LR,
-    save_every=SAVE_EVERY,
+    log_every=LOG_EVERY,
     eval_every=EVAL_EVERY,
+    save_every=SAVE_EVERY,
     checkpoint_dir=CHECKPOINT_DIR,
 ):
     device = torch.device(
@@ -374,10 +412,14 @@ def train(
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    for epoch in range(n_epochs):
-        total_loss = 0.0
-        pbar = tqdm(dataloader, desc=f"epoch {epoch}")
-        for batch in pbar:
+    global_step = 0
+    running_loss = 0.0
+    running_count = 0
+    last_loss = 0.0
+    pbar = tqdm(total=total_steps, desc="train")
+    done = False
+    while not done:
+        for batch in dataloader:
             images = batch["images"].to(device)
             obs = batch["obs"].to(device)
             actions = batch["actions"].to(device)
@@ -387,64 +429,94 @@ def train(
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            global_step += 1
+            last_loss = loss.item()
+            running_loss += last_loss
+            running_count += 1
+            pbar.update(1)
+            pbar.set_postfix(loss=f"{last_loss:.4f}")
 
-        avg_loss = total_loss / len(dataloader)
-        log_dict = {"epoch": epoch, "avg_loss": avg_loss}
-        print(f"epoch {epoch}: avg_loss={avg_loss:.4f}")
+            # collect everything due on this step into one log call so wandb sees
+            # a single record per step (log and eval cadences can coincide)
+            log_dict = {}
+            if global_step % log_every == 0:
+                avg_loss = running_loss / running_count
+                log_dict["avg_loss"] = avg_loss
+                print(f"step {global_step}: avg_loss={avg_loss:.4f}")
+                running_loss = 0.0
+                running_count = 0
 
-        if epoch % eval_every == 0 or epoch == n_epochs - 1:
-            for n_steps in [1, 2, 5, 10, 20, 50]:
-                success_rate = evaluate(policy, device, n_episodes=20, n_steps=n_steps)
-                log_dict[f"success_rate/n_steps_{n_steps}"] = success_rate
-                print(
-                    f"epoch {epoch}: n_steps={n_steps}, "
-                    f"success_rate={success_rate:.2f}"
+            if global_step % eval_every == 0:
+                log_dict.update(run_eval(policy, device, global_step))
+
+            if log_dict:
+                wandb.log(log_dict, step=global_step)
+
+            if global_step % save_every == 0:
+                save_checkpoint(
+                    policy, optimizer, global_step, last_loss, checkpoint_dir
                 )
 
-        wandb.log(log_dict, step=epoch)
+            if global_step >= total_steps:
+                done = True
+                break
 
-        if epoch % save_every == 0 or epoch == n_epochs - 1:
-            checkpoint_path = os.path.join(
-                checkpoint_dir, f"checkpoint_epoch_{epoch}.pt"
-            )
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": policy.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "loss": avg_loss,
-                },
-                checkpoint_path,
-            )
-            print(f"Saved checkpoint to {checkpoint_path}")
+    # final eval + checkpoint, unless the last step already triggered them
+    final_dict = {}
+    if total_steps % eval_every != 0:
+        final_dict.update(run_eval(policy, device, global_step))
+    if running_count > 0:
+        final_dict["avg_loss"] = running_loss / running_count
+    if final_dict:
+        wandb.log(final_dict, step=global_step)
+    if total_steps % save_every != 0:
+        save_checkpoint(policy, optimizer, global_step, last_loss, checkpoint_dir)
+    pbar.close()
 
 
 # =============================================================================
 # 5. Main
 # =============================================================================
+WANDB_PROJECT = "pushT-slim"
+WANDB_ENTITY = "robot_learning_collective"
+
+
 def main():
     run_name = f"pusht-dit-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+
+    policy = DiTPolicy()
+    dataset = PushTDataset()
+    dataloader = DataLoader(
+        dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0
+    )
+
+    steps_per_epoch = len(dataloader)
+    print(
+        f"steps/epoch={steps_per_epoch}, training for {TOTAL_STEPS} total steps "
+        f"(~{math.ceil(TOTAL_STEPS / steps_per_epoch)} passes over the data)"
+    )
+
     wandb.init(
-        project="pusht-slim",
+        project=WANDB_PROJECT,
+        entity=WANDB_ENTITY,
         name=run_name,
         config={
-            "n_epochs": N_EPOCHS,
+            "total_steps": TOTAL_STEPS,
+            "steps_per_epoch": steps_per_epoch,
+            "log_every": LOG_EVERY,
+            "eval_every": EVAL_EVERY,
+            "save_every": SAVE_EVERY,
             "lr": LR,
             "n_layers": N_LAYERS,
             "n_heads": N_HEADS,
             "hidden_dim": HIDDEN_DIM,
+            "backbone": BACKBONE,
             "n_obs": N_OBS,
             "n_actions": N_ACTIONS,
             "n_action_steps": N_ACTION_STEPS,
             "batch_size": BATCH_SIZE,
         },
     )
-
-    policy = DiTPolicy()
-    dataset = PushTDataset()
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
 
     train(policy=policy, dataloader=dataloader)
 

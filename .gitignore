@@ -3,3 +3,5 @@
 checkpoints
 wandb
 .DS_Store
+__pycache__/
+*.log
