@@ -9,6 +9,8 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 import torchvision.models as models
+import torchvision.transforms as T
+import torchvision.transforms.functional as TF
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import gymnasium as gym
 import gym_pusht  
@@ -38,6 +40,10 @@ WANDB_ENTITY = "robot_learning_collective"
 # so it lives at the same scale as the Gaussian noise used by flow matching,
 # then unnormalize the model's output before sending it back to the env.
 COORD_MIN, COORD_MAX = 0.0, 512.0
+IMG_SIZE = 224
+PRE_CROP_SIZE = 256  # resize target before random cropping to IMG_SIZE
+IMG_MEAN = [0.485, 0.456, 0.406]
+IMG_STD = [0.229, 0.224, 0.225]
 
 def normalize(x):
     return 2.0 * (x - COORD_MIN) / (COORD_MAX - COORD_MIN) - 1.0
@@ -124,7 +130,7 @@ class PushTDataset(Dataset):
     def __init__(self, dataset_id, prediction_horizon):
         self.dataset = LeRobotDataset(dataset_id)
         self.prediction_horizon = prediction_horizon
-        self.valid_indices = self._determine_valid_indices()
+        self.random_crop = T.RandomCrop(IMG_SIZE)
 
         # decode every frame once and keep it in RAM; afterwards each __getitem__
         print("Caching dataset in memory...")
@@ -136,48 +142,35 @@ class PushTDataset(Dataset):
                 "observation.state": item["observation.state"],
                 "action": item["action"],
             }
+        self.episode_indices = np.array(self.dataset.hf_dataset["episode_index"])
         print("Done caching.")
 
-    def _determine_valid_indices(self):
-        valid_indices = []
-        episode_indices = np.array(self.dataset.hf_dataset["episode_index"])
-
-        for idx in range(len(self.dataset)):
-            episode = episode_indices[idx]
-
-            # Need enough future actions for one predicted horizon.
-            future_idx = idx + self.prediction_horizon - 1
-            if future_idx >= len(self.dataset):
-                continue
-
-            # and those future frames must be in the same episode
-            future_episode = episode_indices[future_idx].item()
-            if future_episode == episode:
-                valid_indices.append(idx)
-
-        return valid_indices
-
     def __len__(self):
-        return len(self.valid_indices)
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        start_idx = self.valid_indices[idx]
+        current_episode = self.episode_indices[idx]
 
-        obs = self.cache[start_idx]["observation.state"]
-        actions = torch.stack(
-            [
-                self.cache[i]["action"]
-                for i in range(start_idx, start_idx + self.prediction_horizon)
-            ]
-        )
-        images = self.cache[start_idx]["observation.image"]
+        img = TF.resize(
+            self.cache[idx]["observation.image"],
+            [PRE_CROP_SIZE, PRE_CROP_SIZE],
+            antialias=True,)
+        
+        img = self.random_crop(img)
+        img = TF.normalize(img, IMG_MEAN, IMG_STD)
 
-        # normalize positions and actions to [-1, 1]; images are already in [0, 1]
-        obs = normalize(obs)
-        actions = normalize(actions)
+        obs = normalize(self.cache[idx]["observation.state"])
 
-        return {"images": images, "obs": obs, "actions": actions}
+        actions = torch.zeros(self.prediction_horizon, 2)
+        mask = torch.zeros(self.prediction_horizon, 2)
+        
+        for k in range(self.prediction_horizon):
+            i = idx + k
+            if i < len(self.dataset) and self.episode_indices[i] == current_episode:
+                actions[k] = normalize(self.cache[i]["action"])
+                mask[k] = 1.0
 
+        return img, obs, actions.flatten(), mask.flatten()
 
 # =============================================================================
 # 3. Model
