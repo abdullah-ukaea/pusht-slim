@@ -1,6 +1,6 @@
 .python-version
 .vscode
-checkpoints
+checkpoints*
 wandb
 .DS_Store
 __pycache__/
