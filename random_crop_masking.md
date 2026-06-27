@@ -45,8 +45,32 @@ checkpoint), comparing the old eval preprocessing against the training-matched o
 **Fix:** `PushTAdapter.observe` now applies `resize(256) -> center-crop(224)` (center crop
 for eval, vs the training random crop). See `eval_check.py` for the A/B harness.
 
-**Caveat — "loss not converging" is a separate issue.** Training loss is computed entirely
-on the (already-correct) training pipeline, so the eval mismatch does not explain it. With
-the eval fixed, a mid-training checkpoint already reaches 25% SR, so the run was healthier
-than the SR=0 metric implied. The loss behavior (bouncing ~0.3–1.4 around step 80k) still
-warrants a separate look.
+## "Loss much higher" was a reduction-scale artifact — also fixed
+
+The loss looked alarming (~4.0 at start, ~0.5–1.0 at step 75k) but the run was actually
+converging fine. The branch had changed the loss reduction from `main`'s full mean
+(`mse_loss(...)`) to a **sum over the 16-step prediction horizon**:
+
+```python
+(loss * masks).sum(1).mean()   # sums over PREDICTION_HORIZON=16
+```
+
+Masks are full for almost every sample (only the last 15 frames of an episode are partially
+masked), so this just multiplies the reported loss by ~16. Dividing by 16, the run tracks
+the baselines almost exactly:
+
+| | start | converged |
+|--------------------------|-------|-----------------------|
+| baselines (full-mean)    | ~0.37 | ~0.02–0.04            |
+| this run (sum-over-16)   | ~4.0  | ~0.5–1.0 (step 75k)   |
+| this run ÷ 16            | ~0.25 | ~0.03–0.06            |
+
+Summing also inflated the gradient magnitude ~16x (effective LR ~16x higher), which —
+together with the new random-crop augmentation — explains the bouncy loss curve.
+
+**Fix:** use a proper masked mean so the loss is on the baseline scale and the gradient
+magnitude is comparable:
+
+```python
+(loss * masks).sum() / masks.sum().clamp(min=1)
+```

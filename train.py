@@ -343,7 +343,11 @@ class DiTPolicy(nn.Module):
 
         v_pred = self.forward(x_t, t, images, obs)
         loss = torch.nn.functional.mse_loss(v_pred, actions - noise, reduction="none")
-        return (loss * masks).sum(1).mean()
+        # Masked mean over valid (in-episode) timesteps. Averaging — rather than
+        # summing over the horizon — keeps the loss on the same scale as an
+        # unmasked mean, so it's comparable across runs and doesn't inflate the
+        # effective learning rate by ~PREDICTION_HORIZON.
+        return (loss * masks).sum() / masks.sum().clamp(min=1)
 
     @torch.no_grad()
     def inference(self, images, obs, n_steps=N_DENOISING_STEPS):
