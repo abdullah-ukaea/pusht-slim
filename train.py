@@ -417,6 +417,27 @@ def save_checkpoint(policy, optimizer, global_step, loss, checkpoint_dir):
     print(f"Saved checkpoint to {checkpoint_path}")
 
 
+# Kept as a free function rather than a DiTPolicy method on purpose: we compile
+# the module (torch.compile(policy)) and call policy(...) directly, so the loss
+# must live outside forward. A method would route through the uncompiled
+# self.forward, making the compile a no-op.
+def flow_matching_loss(policy, images, obs, actions, masks):
+    B = actions.shape[0]
+    actions = actions.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
+    masks = masks.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
+
+    t = torch.rand(B, device=actions.device)
+    noise = torch.randn_like(actions)
+    x_t = (1 - t[:, None, None]) * noise + t[:, None, None] * actions
+    v_pred = policy(x_t, t, images, obs)
+    loss = nn.functional.mse_loss(v_pred, actions - noise, reduction="none")
+    # Masked mean over valid (in-episode) timesteps. Averaging — rather than
+    # summing over the horizon — keeps the loss on the same scale as an unmasked
+    # mean, so it's comparable across runs and doesn't inflate the effective
+    # learning rate by ~PREDICTION_HORIZON.
+    return (loss * masks).sum() / masks.sum().clamp(min=1)
+
+
 def train(
     policy,
     dataloader,
@@ -453,19 +474,7 @@ def train(
         images, obs, actions, mask = [t.to(device) for t in batch]
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            B = actions.shape[0]
-            actions = actions.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
-            mask = mask.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
-            t = torch.rand(B, device=device)
-            noise = torch.randn_like(actions)
-            x_t = (1 - t[:, None, None]) * noise + t[:, None, None] * actions
-            v_pred = policy(x_t, t, images, obs)
-            loss = nn.functional.mse_loss(v_pred, actions - noise, reduction="none")
-            # Masked mean over valid (in-episode) timesteps. Averaging — rather
-            # than summing over the horizon — keeps the loss on the same scale as
-            # an unmasked mean, so it's comparable across runs and doesn't inflate
-            # the effective learning rate by ~PREDICTION_HORIZON.
-            loss = (loss * mask).sum() / mask.sum().clamp(min=1)
+            loss = flow_matching_loss(policy, images, obs, actions, mask)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
