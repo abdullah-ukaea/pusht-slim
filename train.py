@@ -157,7 +157,6 @@ class PushTDataset(Dataset):
             antialias=True,)
         
         img = self.random_crop(img)
-        img = TF.normalize(img, IMG_MEAN, IMG_STD)
 
         obs = normalize(self.cache[idx]["observation.state"])
 
@@ -331,14 +330,18 @@ class DiTPolicy(nn.Module):
             x = block(x, cond)
         return self.action_out(x)
 
-    def training_step(self, images, obs, actions):
-        t = torch.rand(actions.shape[0]).to(actions.device)
+    def training_step(self, images, obs, actions, masks):
+        B = actions.shape[0]
+        actions = actions.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
+        masks = masks.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
+
+        t = torch.rand(B).to(actions.device)
         noise = torch.randn_like(actions)
         x_t = (1 - t[:, None, None]) * noise + t[:, None, None] * actions
 
         v_pred = self.forward(x_t, t, images, obs)
-        target = actions - noise  
-        return torch.nn.functional.mse_loss(v_pred, target)
+        loss = torch.nn.functional.mse_loss(v_pred, actions - noise, reduction="none")
+        return (loss * masks).sum(1).mean()
 
     @torch.no_grad()
     def inference(self, images, obs, n_steps=N_DENOISING_STEPS):
@@ -406,11 +409,9 @@ def train(
             dataloader_iter = iter(dataloader)
             batch = next(dataloader_iter)
 
-        images = batch["images"].to(device)
-        obs = batch["obs"].to(device)
-        actions = batch["actions"].to(device)
+        images, obs, actions, mask = [t.to(device) for t in batch]
 
-        loss = policy.training_step(images, obs, actions)
+        loss = policy.training_step(images, obs, actions, mask)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
