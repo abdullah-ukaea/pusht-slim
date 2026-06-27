@@ -7,10 +7,10 @@ import wandb
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import torchvision.models as models
 import torchvision.transforms as T
-import torchvision.transforms.functional as TF
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import gymnasium as gym
 import gym_pusht  
@@ -40,8 +40,11 @@ WANDB_ENTITY = "robot_learning_collective"
 # so it lives at the same scale as the Gaussian noise used by flow matching,
 # then unnormalize the model's output before sending it back to the env.
 COORD_MIN, COORD_MAX = 0.0, 512.0
-IMG_SIZE = 224
-PRE_CROP_SIZE = 256  # resize target before random cropping to IMG_SIZE
+# PushT frames are 96x96. lerobot-style: crop at native resolution (no upsample)
+# and let SpatialSoftmax pool the small feature map (see ImageEncoder).
+NATIVE_IMG_SIZE = 96
+CROP_SIZE = 84  # random crop (train) / center crop (eval), ~0.875 of native
+NUM_KEYPOINTS = 32  # SpatialSoftmax keypoints
 IMG_MEAN = [0.485, 0.456, 0.406]
 IMG_STD = [0.229, 0.224, 0.225]
 
@@ -68,13 +71,10 @@ class PushTAdapter:
         self.device = device
 
     def observe(self, obs):
-        # env obs dict -> batched, normalized (images, states) on device
+        # env obs dict -> batched, normalized (images, states) on device.
+        # Feed the raw native-resolution frame; the encoder owns cropping (center
+        # crop in eval, random crop in train) so train and eval share one path.
         image = torch.from_numpy(obs["pixels"]).permute(2, 0, 1).float() / 255.0
-        # Match the training image pipeline: resize(256) then crop to IMG_SIZE.
-        # Training uses a random crop for augmentation; eval uses the center crop
-        # so the model sees the same scale/resolution it was trained on.
-        image = TF.resize(image, [PRE_CROP_SIZE, PRE_CROP_SIZE], antialias=True)
-        image = TF.center_crop(image, [IMG_SIZE, IMG_SIZE])
         state = normalize(torch.from_numpy(obs["agent_pos"]).float())
         return image.unsqueeze(0).to(self.device), state.unsqueeze(0).to(self.device)
 
@@ -135,7 +135,6 @@ class PushTDataset(Dataset):
     def __init__(self, dataset_id, prediction_horizon):
         self.dataset = LeRobotDataset(dataset_id)
         self.prediction_horizon = prediction_horizon
-        self.random_crop = T.RandomCrop(IMG_SIZE)
 
         # decode every frame once and keep it in RAM; afterwards each __getitem__
         print("Caching dataset in memory...")
@@ -156,12 +155,9 @@ class PushTDataset(Dataset):
     def __getitem__(self, idx):
         current_episode = self.episode_indices[idx]
 
-        img = TF.resize(
-            self.cache[idx]["observation.image"],
-            [PRE_CROP_SIZE, PRE_CROP_SIZE],
-            antialias=True,)
-        
-        img = self.random_crop(img)
+        # Return the raw native-resolution frame ([0, 1], 3x96x96). Cropping and
+        # normalization happen inside the encoder so train/eval stay in sync.
+        img = self.cache[idx]["observation.image"]
 
         obs = normalize(self.cache[idx]["observation.state"])
 
@@ -179,8 +175,55 @@ class PushTDataset(Dataset):
 # =============================================================================
 # 3. Model
 # =============================================================================
+class SpatialSoftmax(nn.Module):
+    """Spatial soft-argmax pooling (Finn et al. 2015), ported from lerobot/robomimic.
+
+    Turns a (B, C, H, W) feature map into (B, K, 2) keypoint coordinates: the
+    softmax-weighted "center of mass" of each channel's activations. Unlike global
+    average pooling, this preserves *where* features fire, so it stays informative
+    even on the tiny feature maps a stock ResNet produces from small inputs (an
+    84x84 crop -> 512x3x3). A 1x1 conv first remaps C -> num_kp keypoint channels.
+    """
+
+    def __init__(self, input_shape, num_kp=None):
+        super().__init__()
+        self._in_c, self._in_h, self._in_w = input_shape
+        if num_kp is not None:
+            self.nets = nn.Conv2d(self._in_c, num_kp, kernel_size=1)
+            self._out_c = num_kp
+        else:
+            self.nets = None
+            self._out_c = self._in_c
+
+        pos_x, pos_y = np.meshgrid(
+            np.linspace(-1.0, 1.0, self._in_w), np.linspace(-1.0, 1.0, self._in_h)
+        )
+        pos_x = torch.from_numpy(pos_x.reshape(self._in_h * self._in_w, 1)).float()
+        pos_y = torch.from_numpy(pos_y.reshape(self._in_h * self._in_w, 1)).float()
+        self.register_buffer("pos_grid", torch.cat([pos_x, pos_y], dim=1))
+
+    def forward(self, features):
+        if self.nets is not None:
+            features = self.nets(features)
+        batch = features.shape[0]
+        features = features.reshape(-1, self._in_h * self._in_w)
+        attention = F.softmax(features, dim=-1)
+        keypoints = attention @ self.pos_grid  # (B * out_c, 2)
+        return keypoints.reshape(batch, self._out_c, 2)
+
+
 class ImageEncoder(nn.Module):
-    def __init__(self, out_dim):
+    """lerobot/Diffusion-Policy-style vision encoder.
+
+    Solves the "small image + ResNet built for 224" problem the way lerobot does:
+    keep the stock ResNet stem, feed a native-resolution crop (no upsampling), and
+    let SpatialSoftmax pool the resulting tiny feature map into keypoints — instead
+    of preserving resolution via a modified stem or upsampling the input to 224.
+    Cropping lives here (random in train, center in eval) so train and eval share
+    a single code path.
+    """
+
+    def __init__(self, out_dim, crop_size=CROP_SIZE, num_kp=NUM_KEYPOINTS):
         super().__init__()
         weights = models.ResNet34_Weights.DEFAULT
         resnet = models.resnet34(weights=weights)
@@ -195,20 +238,27 @@ class ImageEncoder(nn.Module):
             "img_std", torch.tensor(preprocess.std).view(1, 3, 1, 1)
         )
 
-        # Keep the stock ResNet stem (conv1 stride-2 + maxpool) so 224x224 inputs
-        # downsample 4x before layer1. The stride-1 / no-maxpool stem keeps the
-        # early feature maps at full resolution and OOMs the GPU at this input size.
-        feat_dim = resnet.fc.in_features  # 512 for resnet34
-        self.backbone = nn.Sequential(*list(resnet.children())[:-1])
+        # Same crop for the whole batch (torchvision RandomCrop), matching lerobot.
+        self.random_crop = T.RandomCrop(crop_size)
+        self.center_crop = T.CenterCrop(crop_size)
 
-        self.fc = nn.Linear(feat_dim, out_dim)
+        # Drop avgpool + fc; keep the stock stem and conv stages -> feature map.
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+
+        # Dry run to get the feature-map shape that SpatialSoftmax must index.
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, crop_size, crop_size)
+            feat_shape = self.backbone(dummy).shape[1:]  # (C, H, W)
+        self.pool = SpatialSoftmax(feat_shape, num_kp=num_kp)
+        self.fc = nn.Linear(num_kp * 2, out_dim)
 
     def forward(self, images):
-        # images: (batch, 3, 224, 224)
+        # images: (batch, 3, 96, 96) in [0, 1]
+        images = self.random_crop(images) if self.training else self.center_crop(images)
         images = (images - self.img_mean) / self.img_std
-        
+
         x = self.backbone(images)
-        x = x.flatten(1) 
+        x = self.pool(x).flatten(1)  # (batch, num_kp * 2)
         return self.fc(x)
 
 
@@ -318,7 +368,7 @@ class DiTPolicy(nn.Module):
     def forward(self, x_t, t, images, obs):
         # pure network: noisy actions + time + context -> predicted velocity
         # x_t: (batch, PREDICTION_HORIZON, ROBOT_DOF), t: (batch,)
-        # images: (batch, 3, 224, 224), obs: (batch, ROBOT_DOF)
+        # images: (batch, 3, 96, 96), obs: (batch, ROBOT_DOF)
         images_cond = self.image_encoder(images)
         obs_cond = self.state_encoder(obs)
         timestep_cond = self.timestep_encoder(t)
@@ -491,6 +541,9 @@ def main():
             "n_heads": N_HEADS,
             "hidden_dim": HIDDEN_DIM,
             "backbone": "resnet34",
+            "pooling": "spatial_softmax",
+            "crop_size": CROP_SIZE,
+            "num_keypoints": NUM_KEYPOINTS,
             "robot_dof": ROBOT_DOF,
             "prediction_horizon": PREDICTION_HORIZON,
             "action_chunk_size": ACTION_CHUNK_SIZE,

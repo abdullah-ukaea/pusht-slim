@@ -74,3 +74,48 @@ magnitude is comparable:
 ```python
 (loss * masks).sum() / masks.sum().clamp(min=1)
 ```
+
+## Three solutions to "small image + ResNet built for 224"
+
+PushT frames are **96x96**, but torchvision ResNets are designed for ~224x224: the stock
+stem downsamples 4x immediately (conv1 stride-2 + maxpool), so a small input collapses to a
+tiny feature map (e.g. an 84x84 crop -> `512 x 3 x 3`). Global average pooling over a 3x3
+map throws away almost all *spatial* information — exactly what a control policy needs. The
+three approaches we've now seen each attack this from a different angle:
+
+| approach | stem | input resolution | pooling head |
+|----------|------|------------------|--------------|
+| Anjana's original | conv1 3x3 **stride-1** + `maxpool = Identity` (preserve resolution) | native ~96 | avg-pool + fc |
+| this branch (previous) | **stock** stem | **upsample 96 -> 256 -> crop 224** | avg-pool + fc |
+| **lerobot / Diffusion Policy (now adopted)** | **stock** stem | **native crop (96 -> 84)** | **SpatialSoftmax** + fc |
+
+1. **Fix it at the stem (Anjana's original).** Remove the early downsampling so feature maps
+   stay large and avg-pool still has localized signal to average. Downside: 16x more
+   activation memory — OOMs at 224 (see top of this doc), and it's a non-standard backbone.
+
+2. **Fix it at the input (this branch, previous).** Upsample 96 -> 256 then crop 224 so the
+   stock stem gets the resolution it expects. Downside: 2.67x blurry upsampling, ~7x the
+   spatial elements / compute, and it dragged in the whole stem/OOM fight above.
+
+3. **Fix it at the head (lerobot).** Leave the stem alone, crop at *native* resolution (no
+   upsample), accept the tiny feature map, and replace avg-pool with **SpatialSoftmax** —
+   spatial soft-argmax that returns the (x, y) "center of mass" of each keypoint channel.
+   Soft-argmax gives a *continuous* coordinate, so it resolves position far more finely than
+   a 3x3 grid suggests, and it keeps exactly the positional information avg-pool destroys.
+   This is the original Diffusion Policy / robomimic vision encoder.
+
+### What we changed (now on this branch)
+
+Adopted approach #3, recreating lerobot's cropping + small-image handling:
+
+- **Crop lives in the encoder**, toggled by `self.training`: `RandomCrop(84)` for train,
+  `CenterCrop(84)` for eval (lerobot applies one crop per batch via torchvision transforms).
+  `PushTDataset` and `PushTAdapter.observe` now both emit the **raw 96x96 frame**, so train
+  and eval share a single preprocessing path — the SR=0 mismatch above is now structurally
+  impossible.
+- **No more `resize(256)` upsampling**; we crop at native resolution like lerobot.
+- **SpatialSoftmax pooling head** (`NUM_KEYPOINTS=32`) replaces avg-pool + fc. The stock
+  ResNet34 stem is kept (`children()[:-2]` drops avgpool + fc) and we keep the ImageNet
+  pretrained weights + normalization (a deliberate deviation from lerobot, which trains the
+  backbone from scratch with GroupNorm; we keep BatchNorm + pretraining for the transfer
+  benefit).
