@@ -383,23 +383,6 @@ class DiTPolicy(nn.Module):
             x = block(x, cond)
         return self.action_out(x)
 
-    def training_step(self, images, obs, actions, masks):
-        B = actions.shape[0]
-        actions = actions.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
-        masks = masks.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
-
-        t = torch.rand(B).to(actions.device)
-        noise = torch.randn_like(actions)
-        x_t = (1 - t[:, None, None]) * noise + t[:, None, None] * actions
-
-        v_pred = self.forward(x_t, t, images, obs)
-        loss = torch.nn.functional.mse_loss(v_pred, actions - noise, reduction="none")
-        # Masked mean over valid (in-episode) timesteps. Averaging — rather than
-        # summing over the horizon — keeps the loss on the same scale as an
-        # unmasked mean, so it's comparable across runs and doesn't inflate the
-        # effective learning rate by ~PREDICTION_HORIZON.
-        return (loss * masks).sum() / masks.sum().clamp(min=1)
-
     @torch.no_grad()
     def inference(self, images, obs, n_steps=N_DENOISING_STEPS):
         batch_size = images.shape[0]
@@ -451,10 +434,7 @@ def train(
     torch.set_float32_matmul_precision("high")
 
     policy = policy.to(device)
-
-    # compile the step, not the module: training calls training_step, so
-    # torch.compile(policy) (which only wraps forward) would be a no-op.
-    train_step = torch.compile(policy.training_step)
+    policy = torch.compile(policy)
 
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -473,7 +453,19 @@ def train(
         images, obs, actions, mask = [t.to(device) for t in batch]
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = train_step(images, obs, actions, mask)
+            B = actions.shape[0]
+            actions = actions.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
+            mask = mask.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
+            t = torch.rand(B, device=device)
+            noise = torch.randn_like(actions)
+            x_t = (1 - t[:, None, None]) * noise + t[:, None, None] * actions
+            v_pred = policy(x_t, t, images, obs)
+            loss = nn.functional.mse_loss(v_pred, actions - noise, reduction="none")
+            # Masked mean over valid (in-episode) timesteps. Averaging — rather
+            # than summing over the horizon — keeps the loss on the same scale as
+            # an unmasked mean, so it's comparable across runs and doesn't inflate
+            # the effective learning rate by ~PREDICTION_HORIZON.
+            loss = (loss * mask).sum() / mask.sum().clamp(min=1)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
