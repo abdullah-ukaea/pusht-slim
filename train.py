@@ -444,14 +444,22 @@ def train(
     save_every=SAVE_EVERY,
     checkpoint_dir=CHECKPOINT_DIR,
 ):
-    device = torch.device(
-        "mps"
-        if torch.backends.mps.is_available()
-        else "cuda" if torch.cuda.is_available() else "cpu"
-    )
-    print(f"Training on {device}")
+    device = torch.device("cuda")
+    print("Training on cuda (RTX 4090)")
+
+    # TF32: let fp32 matmuls/convs use the 4090's tensor cores (free speedup).
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
     policy = policy.to(device)
-    policy = torch.compile(policy)
+
+    # Compile the training step, not the module. torch.compile(policy) only wraps
+    # forward, but training calls policy.training_step whose self.forward stays
+    # uncompiled, so wrapping the module is a no-op. Compiling the callable
+    # actually compiles the fwd+bwd graph.
+    train_step = torch.compile(policy.training_step)
+
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -468,7 +476,9 @@ def train(
 
         images, obs, actions, mask = [t.to(device) for t in batch]
 
-        loss = policy.training_step(images, obs, actions, mask)
+        # bf16 autocast: tensor cores for the matmuls/convs, no GradScaler needed.
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = train_step(images, obs, actions, mask)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
