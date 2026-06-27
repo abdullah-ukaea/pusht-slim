@@ -190,19 +190,16 @@ class ImageEncoder(nn.Module):
             "img_std", torch.tensor(preprocess.std).view(1, 3, 1, 1)
         )
 
-        resnet.conv1 = nn.Conv2d(
-            3, 64, kernel_size=3, stride=1, padding=1, bias=False
-        )
-
-        resnet.maxpool = nn.Identity()
-
+        # Keep the stock ResNet stem (conv1 stride-2 + maxpool) so 224x224 inputs
+        # downsample 4x before layer1, matching how the pretrained weights were
+        # trained and keeping early-layer activations small enough to fit in memory.
         feat_dim = resnet.fc.in_features  # 512 for resnet34
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
 
         self.fc = nn.Linear(feat_dim, out_dim)
 
     def forward(self, images):
-        # images: (batch, 3, 96, 96)
+        # images: (batch, 3, 224, 224)
         images = (images - self.img_mean) / self.img_std
         
         x = self.backbone(images)
@@ -316,7 +313,7 @@ class DiTPolicy(nn.Module):
     def forward(self, x_t, t, images, obs):
         # pure network: noisy actions + time + context -> predicted velocity
         # x_t: (batch, PREDICTION_HORIZON, ROBOT_DOF), t: (batch,)
-        # images: (batch, 3, 96, 96), obs: (batch, ROBOT_DOF)
+        # images: (batch, 3, 224, 224), obs: (batch, ROBOT_DOF)
         images_cond = self.image_encoder(images)
         obs_cond = self.state_encoder(obs)
         timestep_cond = self.timestep_encoder(t)
