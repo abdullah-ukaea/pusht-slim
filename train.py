@@ -70,6 +70,11 @@ class PushTAdapter:
     def observe(self, obs):
         # env obs dict -> batched, normalized (images, states) on device
         image = torch.from_numpy(obs["pixels"]).permute(2, 0, 1).float() / 255.0
+        # Match the training image pipeline: resize(256) then crop to IMG_SIZE.
+        # Training uses a random crop for augmentation; eval uses the center crop
+        # so the model sees the same scale/resolution it was trained on.
+        image = TF.resize(image, [PRE_CROP_SIZE, PRE_CROP_SIZE], antialias=True)
+        image = TF.center_crop(image, [IMG_SIZE, IMG_SIZE])
         state = normalize(torch.from_numpy(obs["agent_pos"]).float())
         return image.unsqueeze(0).to(self.device), state.unsqueeze(0).to(self.device)
 

@@ -29,6 +29,24 @@ all blocks it exhausts GPU memory. Restoring the stock stride-2 conv1 + maxpool 
 
 wandb run: https://wandb.ai/robot_learning_collective/pushT-slim/runs/e6191j7v
 
-Loss not converging, SR=0. Most likely a train/eval mismatch: training uses 224x224 crops
-but eval (`PushTAdapter.observe`) still feeds native-resolution frames — the eval path
-needs the same `resize(256) -> center-crop(224)` preprocessing.
+**SR=0 was a train/eval preprocessing mismatch — confirmed and fixed.** Training feeds the
+encoder `resize(256) -> random-crop(224)` images, but eval (`PushTAdapter.observe`) was
+passing native-resolution frames straight through. The model only ever saw 224x224 crops,
+so at eval it got an out-of-distribution scale/resolution and never succeeded.
+
+Verified with an A/B eval on `checkpoints/checkpoint_step_75000.pt` (a *mid*-training
+checkpoint), comparing the old eval preprocessing against the training-matched one:
+
+| eval preprocessing                         | success_rate | avg_max_reward |
+|--------------------------------------------|--------------|----------------|
+| `raw` (native frame, old `observe`)        | 0.000        | 0.113          |
+| `resizecrop` (`resize(256)->center-crop`)  | 0.250        | 0.836          |
+
+**Fix:** `PushTAdapter.observe` now applies `resize(256) -> center-crop(224)` (center crop
+for eval, vs the training random crop). See `eval_check.py` for the A/B harness.
+
+**Caveat — "loss not converging" is a separate issue.** Training loss is computed entirely
+on the (already-correct) training pipeline, so the eval mismatch does not explain it. With
+the eval fixed, a mid-training checkpoint already reaches 25% SR, so the run was healthier
+than the SR=0 metric implied. The loss behavior (bouncing ~0.3–1.4 around step 80k) still
+warrants a separate look.
