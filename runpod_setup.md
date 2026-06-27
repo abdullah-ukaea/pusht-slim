@@ -41,14 +41,7 @@ tmux new-session -d -s train
 tmux send-keys -t train 'source .venv/bin/activate && \
   export WANDB_API_KEY=$(tr -d "[:space:]" < ~/.wandb_personal_key) && \
   export SDL_VIDEODRIVER=dummy && \
-  python -u train.py --batch-size 64 --steps 200000 2>&1 | tee train.log' Enter
+  python -u train.py 2>&1 | tee train.log' Enter
 ```
 - `SDL_VIDEODRIVER=dummy`: headless pygame for eval rollouts.
 - `python -u`: unbuffered output so `train.log` is live.
-
-## Notes
-- `train.py` is **step-based**: `--steps` (total optimizer steps), `--log-every` (default 200), `--eval-every` (default 10000), `--save-every` (default 10000), plus `--batch-size`, `--lr`, `--wandb-project`, `--wandb-entity`.
-- Checkpoints are written as `checkpoints/checkpoint_step_<N>.pt`.
-- `N_OBS = 1` (single-frame observation history).
-- Defaults target W&B project `pushT-slim` under entity `robot_learning_collective`.
-- Watch: `tmux attach -t train` (detach `Ctrl-b d`) or `tail -f train.log`.
