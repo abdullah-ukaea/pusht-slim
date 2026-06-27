@@ -5,9 +5,8 @@ One change on top of Anjana's branch: **restore the stock ResNet stem in `ImageE
 - Anjana's branch kept `main`'s small-image stem (`conv1` stride-1 + `maxpool = Identity`),
   which was tuned for 96x96 frames.
 - With the branch's new 224x224 random crops that stem keeps activations at full
-  resolution (memory blowup) and diverges from how the pretrained weights expect their
-  input. Restoring the stock stride-2 `conv1` + maxpool gives the expected 4x early
-  downsample.
+  resolution, which **OOMs** on the GPU. Restoring the stock stride-2 `conv1` + maxpool
+  downsamples 4x in the stem, shrinking the early feature maps so training fits in memory.
 
 ## Status
 

@@ -191,8 +191,8 @@ class ImageEncoder(nn.Module):
         )
 
         # Keep the stock ResNet stem (conv1 stride-2 + maxpool) so 224x224 inputs
-        # downsample 4x before layer1, matching how the pretrained weights were
-        # trained and keeping early-layer activations small enough to fit in memory.
+        # downsample 4x before layer1. The stride-1 / no-maxpool stem keeps the
+        # early feature maps at full resolution and OOMs the GPU at this input size.
         feat_dim = resnet.fc.in_features  # 512 for resnet34
         self.backbone = nn.Sequential(*list(resnet.children())[:-1])
 
