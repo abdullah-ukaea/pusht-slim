@@ -54,7 +54,6 @@ class PushTDataset(Dataset):
     def __init__(self, dataset_id=DATASET_ID, n_actions=N_ACTIONS):
         self.dataset = LeRobotDataset(dataset_id)
         self.n_actions = n_actions
-        self.valid_indices = self._determine_valid_indices()
 
         # decode every frame once and keep it in RAM; afterwards each __getitem__
         print("Caching dataset in memory...")
@@ -66,50 +65,34 @@ class PushTDataset(Dataset):
                 "observation.state": item["observation.state"],
                 "action": item["action"],
             }
+        self.episode_indices = np.array(self.dataset.hf_dataset["episode_index"])
         print("Done caching.")
 
-    def _determine_valid_indices(self):
-        valid_indices = []
-        episode_indices = np.array(self.dataset.hf_dataset["episode_index"])
-
-        for idx in range(len(self.dataset)):
-            episode = episode_indices[idx]
-
-            # need n_actions frames ahead of this one
-            future_idx = idx + self.n_actions - 1
-            if future_idx >= len(self.dataset):
-                continue
-
-            # and those future frames must be in the same episode
-            future_episode = episode_indices[future_idx].item()
-            if future_episode == episode:
-                valid_indices.append(idx)
-
-        return valid_indices
-
     def __len__(self):
-        return len(self.valid_indices)
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        start_idx = self.valid_indices[idx]
+        current_episode = self.episode_indices[idx]
 
         img = TF.resize(
-            self.cache[start_idx]["observation.image"],
+            self.cache[idx]["observation.image"],
             [IMG_SIZE, IMG_SIZE],
             antialias=True,
         )
         img = TF.normalize(img, IMG_MEAN, IMG_STD)
 
-        obs = normalize(self.cache[start_idx]["observation.state"])
+        obs = normalize(self.cache[idx]["observation.state"])
 
-        actions = torch.stack(
-            [
-                normalize(self.cache[i]["action"])
-                for i in range(start_idx, start_idx + self.n_actions)
-            ]
-        )
+        actions = torch.zeros(self.n_actions, 2)
+        mask = torch.zeros(self.n_actions, 2)
+        
+        for k in range(self.n_actions):
+            i = idx + k
+            if i < len(self.dataset) and self.episode_indices[i] == current_episode:
+                actions[k] = normalize(self.cache[i]["action"])
+                mask[k] = 1.0
 
-        return img, obs, actions.flatten()
+        return img, obs, actions.flatten(), mask.flatten()
 
 
 # ── Model ──────────────────────────────────────────────────────────────────────
@@ -502,19 +485,21 @@ class FlowMatchingTransformerAgent(nn.Module):
         tokens = torch.cat((image_tokens, obs_token), 1)
         return self.post_proc(tokens)
 
-    def forward(self, imgs, obs, ac_flat):
+    def forward(self, imgs, obs, ac_flat, mask_flat):
         # get observation encoding and sample noise/timesteps
         B, device = obs.shape[0], obs.device
         s_t = self.tokenize_obs(imgs, obs)
 
         actions = ac_flat.reshape(B, self.ac_chunk, self.ac_dim)
+        mask = mask_flat.reshape((B, self.ac_chunk, self.ac_dim))
         timestep = torch.rand(B, device=device)
         noise = torch.randn_like(actions)
         noise_acs = (1 - timestep[:, None, None]) * noise + timestep[:, None, None] * actions
-
         _, v_pred = self.noise_net(noise_acs, timestep, s_t)
 
-        return F.mse_loss(v_pred, actions - noise)
+        loss = nn.functional.mse_loss(v_pred, actions-noise)
+        loss = (loss * mask).sum(1)  # mask the loss to only consider "real" acs
+        return loss.mean()
 
     @torch.no_grad()
     def get_actions(self, imgs, obs, n_steps=10):
@@ -594,8 +579,9 @@ def train(agent, loader):
             imgs = imgs.to(device)
             obs = obs.to(device)
             ac_flat = ac_flat.to(device)
+            mask_flat = mask_flat.to(device)
 
-            loss = agent(imgs, obs, ac_flat)
+            loss = agent(imgs, obs, ac_flat, mask_flat)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
