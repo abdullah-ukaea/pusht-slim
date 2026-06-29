@@ -30,7 +30,8 @@ LOG_EVERY = 200
 EVAL_EVERY = 25_000
 EVAL_EPISODES = 20
 SAVE_EVERY = 25_000
-CHECKPOINT_DIR = "checkpoints"
+RUN_NAME = f"pusht-dit-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+CHECKPOINT_DIR = f"checkpoints_{RUN_NAME}"
 BATCH_SIZE = 64
 WANDB_PROJECT = "pushT-slim"
 WANDB_ENTITY = "robot_learning_collective"
@@ -508,7 +509,6 @@ def train(
         save_checkpoint(policy, optimizer, global_step, last_loss, checkpoint_dir)
 
 def main():
-    run_name = f"pusht-dit-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 
     policy = DiTPolicy()
     dataset = PushTDataset(
@@ -528,7 +528,7 @@ def main():
     wandb.init(
         project=WANDB_PROJECT,
         entity=WANDB_ENTITY,
-        name=run_name,
+        name=RUN_NAME,
         config={
             "total_steps": TOTAL_STEPS,
             "steps_per_epoch": steps_per_epoch,
