@@ -24,15 +24,24 @@ DATASET_ID = "lerobot/pusht"
 N_HEADS = 8
 N_LAYERS = 6
 HIDDEN_DIM = 600
-TOTAL_STEPS = 200_000
+TOTAL_STEPS = 50_000
 LR = 1e-4
+# Gradient clipping a la nanoGPT. torch.nn.utils.clip_grad_norm_ returns the
+# total pre-clip grad norm, which we log to watch for instability. Set to a
+# float (nanoGPT uses 1.0) to also clip; None measures the norm without clipping.
+GRAD_CLIP = None
 LOG_EVERY = 200
-EVAL_EVERY = 25_000
+EVAL_EVERY = 5_000
 EVAL_EPISODES = 20
 SAVE_EVERY = 25_000
-RUN_NAME = f"pusht-dit-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+RUN_NAME = f"pusht-dit-bs512-lr1e4-50k-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 CHECKPOINT_DIR = f"checkpoints_{RUN_NAME}"
-BATCH_SIZE = 64
+BATCH_SIZE = 512
+# Background dataloader workers. With num_workers=0 the loader runs in the train
+# process and each step blocks on CPU collation, which (with the GPU step at
+# ~27ms) makes training data-loading bound. A few workers prefetch batches so
+# the GPU step becomes the bottleneck.
+NUM_WORKERS = 8
 WANDB_PROJECT = "pushT-slim"
 WANDB_ENTITY = "robot_learning_collective"
 
@@ -239,8 +248,11 @@ class ImageEncoder(nn.Module):
             "img_std", torch.tensor(preprocess.std).view(1, 3, 1, 1)
         )
 
-        # Same crop for the whole batch (torchvision RandomCrop), matching lerobot.
-        self.random_crop = T.RandomCrop(crop_size)
+        # Same crop window for the whole batch (matching lerobot's RandomCrop).
+        # We index with tensors instead of torchvision's RandomCrop because the
+        # latter calls torch.randint(...).item(), and that .item() forces a
+        # CUDA sync + a torch.compile graph break at the top of the model.
+        self.crop_size = crop_size
         self.center_crop = T.CenterCrop(crop_size)
 
         # Drop avgpool + fc; keep the stock stem and conv stages -> feature map.
@@ -252,6 +264,17 @@ class ImageEncoder(nn.Module):
             feat_shape = self.backbone(dummy).shape[1:]  # (C, H, W)
         self.pool = SpatialSoftmax(feat_shape, num_kp=num_kp)
         self.fc = nn.Linear(num_kp * 2, out_dim)
+
+    def random_crop(self, images):
+        # One random crop window for the whole batch, expressed entirely in
+        # tensor ops (no .item()) so it stays inside the compiled graph.
+        _, _, h, w = images.shape
+        size = self.crop_size
+        top = torch.randint(0, h - size + 1, (1,), device=images.device)
+        left = torch.randint(0, w - size + 1, (1,), device=images.device)
+        rows = top + torch.arange(size, device=images.device)
+        cols = left + torch.arange(size, device=images.device)
+        return images[:, :, rows[:, None], cols[None, :]]
 
     def forward(self, images):
         # images: (batch, 3, 96, 96) in [0, 1]
@@ -464,29 +487,67 @@ def train(
     global_step = 0
     dataloader_iter = iter(dataloader)
 
+    # Rolling per-step timers (reset each log window) so we can see whether we're
+    # data-loading bound or compute bound. data_time covers fetching/collating
+    # the batch and the host->device copy; compute_time covers the forward,
+    # backward and optimizer step (loss.item() below forces a CUDA sync, so the
+    # measured compute time includes the GPU work rather than just the launch).
+    data_time = 0.0
+    compute_time = 0.0
+
     for global_step in range(1, total_steps + 1):
+        t_data_start = time.perf_counter()
         try:
             batch = next(dataloader_iter)
         except StopIteration:
             dataloader_iter = iter(dataloader)
             batch = next(dataloader_iter)
 
-        images, obs, actions, mask = [t.to(device) for t in batch]
+        images, obs, actions, mask = [
+            t.to(device, non_blocking=True) for t in batch
+        ]
+        t_compute_start = time.perf_counter()
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss = flow_matching_loss(policy, images, obs, actions, mask)
         optimizer.zero_grad()
         loss.backward()
+        # nanoGPT-style: clip_grad_norm_ returns the total grad norm pre-clip.
+        # max_norm=inf measures without actually clipping (GRAD_CLIP=None).
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            policy.parameters(),
+            max_norm=GRAD_CLIP if GRAD_CLIP is not None else float("inf"),
+        )
         optimizer.step()
 
         last_loss = loss.item()
+        t_step_end = time.perf_counter()
+
+        data_time += t_compute_start - t_data_start
+        compute_time += t_step_end - t_compute_start
 
         # collect everything due on this step into one log call so wandb sees
         # a single record per step (log and eval cadences can coincide)
         log_dict = {}
         if global_step % log_every == 0:
+            data_ms = data_time / log_every * 1e3
+            compute_ms = compute_time / log_every * 1e3
+            step_ms = data_ms + compute_ms
+            it_per_s = 1e3 / step_ms if step_ms > 0 else 0.0
+            grad_norm_val = grad_norm.item()
             log_dict["loss"] = last_loss
-            print(f"step {global_step}: loss={last_loss:.4f}")
+            log_dict["grad_norm"] = grad_norm_val
+            log_dict["time/data_ms"] = data_ms
+            log_dict["time/compute_ms"] = compute_ms
+            log_dict["time/step_ms"] = step_ms
+            log_dict["time/it_per_s"] = it_per_s
+            print(
+                f"step {global_step}: loss={last_loss:.4f} grad_norm={grad_norm_val:.3f} | "
+                f"data={data_ms:.1f}ms compute={compute_ms:.1f}ms "
+                f"step={step_ms:.1f}ms ({it_per_s:.1f} it/s)"
+            )
+            data_time = 0.0
+            compute_time = 0.0
 
         if global_step % eval_every == 0:
             log_dict.update(evaluate(
@@ -522,7 +583,13 @@ def main():
         prediction_horizon=PREDICTION_HORIZON,
     )
     dataloader = DataLoader(
-        dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        persistent_workers=NUM_WORKERS > 0,
+        prefetch_factor=4 if NUM_WORKERS > 0 else None,
     )
 
     steps_per_epoch = len(dataloader)
