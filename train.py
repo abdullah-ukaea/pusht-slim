@@ -20,21 +20,26 @@ PREDICTION_HORIZON = 16
 ACTION_CHUNK_SIZE = 8
 N_DENOISING_STEPS = 10
 DATASET_ID = "lerobot/pusht"
-# DiT sized to ~47.5M (matching lerobot's DiT backbone): hidden 600, 6 layers, 8 heads
+# DiT sized to ~200M: hidden 896, 12 layers, 8 heads. Model scale was the
+# dominant success-rate lever in the experiment rounds (EXPERIMENTS.md on the
+# feat/zaringleb/claude-flow-experiments branch): ~47M plateaued at SR ~0.5,
+# 200M reaches ~0.6-0.7.
 N_HEADS = 8
-N_LAYERS = 6
-HIDDEN_DIM = 600
-TOTAL_STEPS = 50_000
+N_LAYERS = 12
+HIDDEN_DIM = 896
+TOTAL_STEPS = 100_000
 LR = 1e-4
+WARMUP_STEPS = 500   # linear LR warmup
+LR_MIN = 1e-6        # cosine decay floor
 # Gradient clipping a la nanoGPT. torch.nn.utils.clip_grad_norm_ returns the
 # total pre-clip grad norm, which we log to watch for instability. Set to a
 # float (nanoGPT uses 1.0) to also clip; None measures the norm without clipping.
 GRAD_CLIP = None
 LOG_EVERY = 200
-EVAL_EVERY = 5_000
-EVAL_EPISODES = 20
+EVAL_EVERY = 10_000
+EVAL_EPISODES = 50  # SR noise at 20 episodes was +-0.11; 50 brings it to ~+-0.07
 SAVE_EVERY = 25_000
-RUN_NAME = f"pusht-dit-bs512-lr1e4-50k-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+RUN_NAME = f"pusht-dit-200m-bs512-lr1e4-100k-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 CHECKPOINT_DIR = f"checkpoints_{RUN_NAME}"
 BATCH_SIZE = 512
 # Background dataloader workers. With num_workers=0 the loader runs in the train
@@ -132,10 +137,15 @@ def evaluate(policy, device, n_episodes, render, n_steps):
 
     env.close()
     policy.train()
-    return {
+    metrics = {
         "success_rate": successes / n_episodes,
         "avg_max_reward": sum(max_rewards) / n_episodes,
     }
+    print(
+        f"[eval] success_rate={metrics['success_rate']:.3f} "
+        f"avg_max_reward={metrics['avg_max_reward']:.3f} (n_episodes={n_episodes})"
+    )
+    return metrics
 
 
 # =============================================================================
@@ -222,8 +232,23 @@ class SpatialSoftmax(nn.Module):
         return keypoints.reshape(batch, self._out_c, 2)
 
 
+def _replace_bn_with_gn(module):
+    """Recursively swap every BatchNorm2d for a GroupNorm (num_groups = C // 16),
+    matching lerobot's Diffusion Policy vision encoder. GroupNorm avoids
+    BatchNorm's train/eval running-stat mismatch, which measurably hurt final
+    task precision in the experiment rounds."""
+    for name, child in module.named_children():
+        if isinstance(child, nn.BatchNorm2d):
+            c = child.num_features
+            setattr(module, name, nn.GroupNorm(max(1, c // 16), c))
+        else:
+            _replace_bn_with_gn(child)
+
+
 class ImageEncoder(nn.Module):
-    """lerobot/Diffusion-Policy-style vision encoder.
+    """lerobot/Diffusion-Policy-style vision encoder: ResNet18 + GroupNorm,
+    trained from scratch (no ImageNet weights — pretrained features on the
+    synthetic PushT frames scored worse in the experiment rounds).
 
     Solves the "small image + ResNet built for 224" problem the way lerobot does:
     keep the stock ResNet stem, feed a native-resolution crop (no upsampling), and
@@ -235,18 +260,13 @@ class ImageEncoder(nn.Module):
 
     def __init__(self, out_dim, crop_size=CROP_SIZE, num_kp=NUM_KEYPOINTS):
         super().__init__()
-        weights = models.ResNet34_Weights.DEFAULT
-        resnet = models.resnet34(weights=weights)
+        resnet = models.resnet18(weights=None)
+        _replace_bn_with_gn(resnet)
 
-        # Reuse the exact normalization the pretrained weights expect, sourced
-        # from the weights metadata so it can't drift out of sync.
-        preprocess = weights.transforms()
-        self.register_buffer(
-            "img_mean", torch.tensor(preprocess.mean).view(1, 3, 1, 1)
-        )
-        self.register_buffer(
-            "img_std", torch.tensor(preprocess.std).view(1, 3, 1, 1)
-        )
+        # Standard ImageNet stats — the model trains from scratch, so any fixed
+        # normalization works; these keep inputs on a familiar scale.
+        self.register_buffer("img_mean", torch.tensor(IMG_MEAN).view(1, 3, 1, 1))
+        self.register_buffer("img_std", torch.tensor(IMG_STD).view(1, 3, 1, 1))
 
         # Same crop window for the whole batch (matching lerobot's RandomCrop).
         # We index with tensors instead of torchvision's RandomCrop because the
@@ -422,7 +442,7 @@ class DiTPolicy(nn.Module):
 # =============================================================================
 # 4. Training
 # =============================================================================
-def save_checkpoint(policy, optimizer, global_step, loss, checkpoint_dir):
+def save_checkpoint(policy, optimizer, scheduler, global_step, loss, checkpoint_dir):
     checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{global_step}.pt")
 
     # torch.compile wraps the model and stores the real model in _orig_mod.
@@ -433,6 +453,7 @@ def save_checkpoint(policy, optimizer, global_step, loss, checkpoint_dir):
             "step": global_step,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
             "loss": loss,
         },
         checkpoint_path,
@@ -481,6 +502,16 @@ def train(
     policy = torch.compile(policy)
 
     optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
+
+    # Linear warmup then cosine decay to LR_MIN (lerobot-style schedule).
+    def lr_lambda(step):
+        if step < WARMUP_STEPS:
+            return (step + 1) / WARMUP_STEPS
+        progress = (step - WARMUP_STEPS) / max(1, total_steps - WARMUP_STEPS)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return LR_MIN / lr + (1.0 - LR_MIN / lr) * cosine
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     last_loss = 0.0
@@ -519,6 +550,7 @@ def train(
             max_norm=GRAD_CLIP if GRAD_CLIP is not None else float("inf"),
         )
         optimizer.step()
+        scheduler.step()
 
         last_loss = loss.item()
         t_step_end = time.perf_counter()
@@ -536,6 +568,7 @@ def train(
             it_per_s = 1e3 / step_ms if step_ms > 0 else 0.0
             grad_norm_val = grad_norm.item()
             log_dict["loss"] = last_loss
+            log_dict["lr"] = scheduler.get_last_lr()[0]
             log_dict["grad_norm"] = grad_norm_val
             log_dict["time/data_ms"] = data_ms
             log_dict["time/compute_ms"] = compute_ms
@@ -560,7 +593,7 @@ def train(
 
         if global_step % save_every == 0:
             save_checkpoint(
-                policy, optimizer, global_step, last_loss, checkpoint_dir
+                policy, optimizer, scheduler, global_step, last_loss, checkpoint_dir
             )
 
     # final eval + checkpoint, unless the last step already triggered them
@@ -573,7 +606,7 @@ def train(
     if final_dict:
         wandb.log(final_dict, step=global_step)
     if total_steps % save_every != 0:
-        save_checkpoint(policy, optimizer, global_step, last_loss, checkpoint_dir)
+        save_checkpoint(policy, optimizer, scheduler, global_step, last_loss, checkpoint_dir)
 
 def main():
 
@@ -610,10 +643,12 @@ def main():
             "eval_episodes": EVAL_EPISODES,
             "save_every": SAVE_EVERY,
             "lr": LR,
+            "warmup_steps": WARMUP_STEPS,
+            "lr_min": LR_MIN,
             "n_layers": N_LAYERS,
             "n_heads": N_HEADS,
             "hidden_dim": HIDDEN_DIM,
-            "backbone": "resnet34",
+            "backbone": "resnet18-gn-scratch",
             "pooling": "spatial_softmax",
             "crop_size": CROP_SIZE,
             "num_keypoints": NUM_KEYPOINTS,
