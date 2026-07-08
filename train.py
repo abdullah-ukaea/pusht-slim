@@ -9,7 +9,6 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-import torchvision.models as models
 import torchvision.transforms as T
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import gymnasium as gym
@@ -39,7 +38,7 @@ LOG_EVERY = 200
 EVAL_EVERY = 10_000
 EVAL_EPISODES = 50  # SR noise at 20 episodes was +-0.11; 50 brings it to ~+-0.07
 SAVE_EVERY = 25_000
-RUN_NAME = f"pusht-dit-200m-bs512-lr1e4-100k-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+RUN_NAME = f"exp-dinov2-vits14-200m-100k-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 CHECKPOINT_DIR = f"checkpoints_{RUN_NAME}"
 BATCH_SIZE = 512
 # Background dataloader workers. With num_workers=0 the loader runs in the train
@@ -232,39 +231,25 @@ class SpatialSoftmax(nn.Module):
         return keypoints.reshape(batch, self._out_c, 2)
 
 
-def _replace_bn_with_gn(module):
-    """Recursively swap every BatchNorm2d for a GroupNorm (num_groups = C // 16),
-    matching lerobot's Diffusion Policy vision encoder. GroupNorm avoids
-    BatchNorm's train/eval running-stat mismatch, which measurably hurt final
-    task precision in the experiment rounds."""
-    for name, child in module.named_children():
-        if isinstance(child, nn.BatchNorm2d):
-            c = child.num_features
-            setattr(module, name, nn.GroupNorm(max(1, c // 16), c))
-        else:
-            _replace_bn_with_gn(child)
-
-
 class ImageEncoder(nn.Module):
-    """lerobot/Diffusion-Policy-style vision encoder: ResNet18 + GroupNorm,
-    trained from scratch (no ImageNet weights — pretrained features on the
-    synthetic PushT frames scored worse in the experiment rounds).
+    """Vision encoder: DINOv2 ViT-S/14 (self-supervised pretrained), fine-tuned
+    end-to-end, replacing the from-scratch ResNet18+GN of main.
 
-    Solves the "small image + ResNet built for 224" problem the way lerobot does:
-    keep the stock ResNet stem, feed a native-resolution crop (no upsampling), and
-    let SpatialSoftmax pool the resulting tiny feature map into keypoints — instead
-    of preserving resolution via a modified stem or upsampling the input to 224.
-    Cropping lives here (random in train, center in eval) so train and eval share
-    a single code path.
+    The 84x84 crop is exactly 6x14 pixels, so the ViT sees a 6x6 patch grid with
+    no resizing. Its 36 patch tokens are reshaped back into a (embed_dim, 6, 6)
+    feature map and pooled by the same SpatialSoftmax -> keypoints -> linear
+    pipeline main uses, so only the backbone changes. Cropping lives here
+    (random in train, center in eval) so train and eval share a single code path.
     """
 
     def __init__(self, out_dim, crop_size=CROP_SIZE, num_kp=NUM_KEYPOINTS):
         super().__init__()
-        resnet = models.resnet18(weights=None)
-        _replace_bn_with_gn(resnet)
+        self.backbone = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
+        self.patch_size = self.backbone.patch_size  # 14
+        assert crop_size % self.patch_size == 0, "crop must be a multiple of the ViT patch size"
+        self._grid = crop_size // self.patch_size  # 6
 
-        # Standard ImageNet stats — the model trains from scratch, so any fixed
-        # normalization works; these keep inputs on a familiar scale.
+        # ImageNet stats, matching DINOv2's pretraining normalization.
         self.register_buffer("img_mean", torch.tensor(IMG_MEAN).view(1, 3, 1, 1))
         self.register_buffer("img_std", torch.tensor(IMG_STD).view(1, 3, 1, 1))
 
@@ -275,13 +260,7 @@ class ImageEncoder(nn.Module):
         self.crop_size = crop_size
         self.center_crop = T.CenterCrop(crop_size)
 
-        # Drop avgpool + fc; keep the stock stem and conv stages -> feature map.
-        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
-
-        # Dry run to get the feature-map shape that SpatialSoftmax must index.
-        with torch.no_grad():
-            dummy = torch.zeros(1, 3, crop_size, crop_size)
-            feat_shape = self.backbone(dummy).shape[1:]  # (C, H, W)
+        feat_shape = (self.backbone.embed_dim, self._grid, self._grid)
         self.pool = SpatialSoftmax(feat_shape, num_kp=num_kp)
         self.fc = nn.Linear(num_kp * 2, out_dim)
 
@@ -301,7 +280,10 @@ class ImageEncoder(nn.Module):
         images = self.random_crop(images) if self.training else self.center_crop(images)
         images = (images - self.img_mean) / self.img_std
 
-        x = self.backbone(images)
+        # (B, 36, embed_dim) patch tokens -> (B, embed_dim, 6, 6) feature map
+        tokens = self.backbone.forward_features(images)["x_norm_patchtokens"]
+        b, n, c = tokens.shape
+        x = tokens.transpose(1, 2).reshape(b, c, self._grid, self._grid)
         x = self.pool(x).flatten(1)  # (batch, num_kp * 2)
         return self.fc(x)
 
@@ -648,7 +630,7 @@ def main():
             "n_layers": N_LAYERS,
             "n_heads": N_HEADS,
             "hidden_dim": HIDDEN_DIM,
-            "backbone": "resnet18-gn-scratch",
+            "backbone": "dinov2-vits14-pretrained",
             "pooling": "spatial_softmax",
             "crop_size": CROP_SIZE,
             "num_keypoints": NUM_KEYPOINTS,
