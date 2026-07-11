@@ -1,5 +1,8 @@
 torch>=2.4,<3
-lerobot==0.5.1
+torchvision
+huggingface_hub
+pandas
+pyarrow
 gym-pusht==0.1.6
 pymunk==6.6.0
 wandb
