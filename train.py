@@ -5,14 +5,16 @@ import time
 
 import wandb
 import numpy as np
+import pandas as pd
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from torchvision.io import read_video
+from huggingface_hub import hf_hub_download
 import gymnasium as gym
-import gym_pusht  
+import gym_pusht
 
 ROBOT_DOF = 2
 PREDICTION_HORIZON = 16
@@ -151,45 +153,60 @@ def evaluate(policy, device, n_episodes, render, n_steps):
 # 2. Dataset
 # =============================================================================
 class PushTDataset(Dataset):
-    def __init__(self, dataset_id, prediction_horizon):
-        self.dataset = LeRobotDataset(dataset_id)
-        self.prediction_horizon = prediction_horizon
+    """PushT, loaded straight from the HF hub without lerobot.
 
-        # decode every frame once and keep it in RAM; afterwards each __getitem__
-        print("Caching dataset in memory...")
-        self.cache = {}
-        for idx in range(len(self.dataset)):
-            item = self.dataset[idx]
-            self.cache[idx] = {
-                "observation.image": item["observation.image"],
-                "observation.state": item["observation.state"],
-                "action": item["action"],
-            }
-        self.episode_indices = np.array(self.dataset.hf_dataset["episode_index"])
-        print("Done caching.")
+    The dataset (v3 format) is just two files: one MP4 with every frame of
+    every episode concatenated in order, and one parquet with the matching
+    per-frame state/action/episode metadata (row i <-> video frame i). We
+    decode the whole video once up front (~7s) and keep everything in RAM
+    (~2.8 GB), so __getitem__ is pure tensor slicing.
+    """
+
+    def __init__(self, dataset_id, prediction_horizon):
+        video_path = hf_hub_download(
+            dataset_id, "videos/observation.image/chunk-000/file-000.mp4",
+            repo_type="dataset",
+        )
+        meta_path = hf_hub_download(
+            dataset_id, "data/chunk-000/file-000.parquet", repo_type="dataset"
+        )
+
+        meta = pd.read_parquet(meta_path)
+        states = torch.from_numpy(np.stack(meta["observation.state"])).float()
+        actions = torch.from_numpy(np.stack(meta["action"])).float()
+        episode_ids = torch.tensor(meta["episode_index"].to_numpy())
+
+        print("Decoding video...")
+        frames, _, _ = read_video(video_path, pts_unit="sec", output_format="TCHW")
+        assert len(frames) == len(meta), (
+            f"video has {len(frames)} frames but metadata has {len(meta)} rows"
+        )
+        print(f"Done: {len(frames)} frames.")
+
+        self.prediction_horizon = prediction_horizon
+        # Raw native-resolution frames in [0, 1]. Cropping and normalization
+        # happen inside the encoder so train/eval stay in sync.
+        self.images = frames.float().div_(255.0)
+        self.states = normalize(states)
+        self.actions = normalize(actions)
+        self.episode_ids = episode_ids
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.images)
 
     def __getitem__(self, idx):
-        current_episode = self.episode_indices[idx]
+        # Future actions over the horizon, zero-padded and masked out past the
+        # end of the episode. Episodes are contiguous, so the frames still in
+        # idx's episode are exactly the prefix of the window.
+        end = min(idx + self.prediction_horizon, len(self))
+        n = int((self.episode_ids[idx:end] == self.episode_ids[idx]).sum())
 
-        # Return the raw native-resolution frame ([0, 1], 3x96x96). Cropping and
-        # normalization happen inside the encoder so train/eval stay in sync.
-        img = self.cache[idx]["observation.image"]
+        actions = torch.zeros(self.prediction_horizon, ROBOT_DOF)
+        mask = torch.zeros(self.prediction_horizon, ROBOT_DOF)
+        actions[:n] = self.actions[idx : idx + n]
+        mask[:n] = 1.0
 
-        obs = normalize(self.cache[idx]["observation.state"])
-
-        actions = torch.zeros(self.prediction_horizon, 2)
-        mask = torch.zeros(self.prediction_horizon, 2)
-        
-        for k in range(self.prediction_horizon):
-            i = idx + k
-            if i < len(self.dataset) and self.episode_indices[i] == current_episode:
-                actions[k] = normalize(self.cache[i]["action"])
-                mask[k] = 1.0
-
-        return img, obs, actions.flatten(), mask.flatten()
+        return self.images[idx], self.states[idx], actions.flatten(), mask.flatten()
 
 # =============================================================================
 # 3. Model

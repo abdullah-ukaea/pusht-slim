@@ -2,14 +2,10 @@
 
 Steps to run `train.py` on a fresh RunPod box (RTX 4090).
 
-## 1. System deps
-```bash
-apt-get update && apt-get install -y tmux ffmpeg
-```
-- `ffmpeg` provides `libavutil.so.56`, required by `torchcodec` (lerobot's video decoder). Without it, training crashes on dataset load.
-- These install to the system root, which is **ephemeral** — reinstall after every VM stop.
+No system deps needed: the dataset is two files (MP4 + parquet) pulled straight
+from the HF hub, and video decoding goes through torchvision's bundled PyAV.
 
-## 2. Python env (uv) — installed on the persistent `/workspace` volume
+## 1. Python env (uv) — installed on the persistent `/workspace` volume
 **Important:** `/root` (incl. `~/.local`, the default uv home) is wiped on VM stop, while `/workspace` persists. Install uv *and* its managed Pythons under `/workspace` so the env survives restarts.
 
 First-time setup:
@@ -28,20 +24,22 @@ After a VM restart, uv + Python + the project `.venv` are all still on `/workspa
 ```bash
 source /workspace/uv/env.sh    # sets PATH + UV_PYTHON_INSTALL_DIR + UV_CACHE_DIR
 ```
-The project `.venv/bin/python` symlinks into `/workspace/uv/python/...`, so `source .venv/bin/activate` works directly after a restart — only the apt deps in step 1 need reinstalling.
+The project `.venv/bin/python` symlinks into `/workspace/uv/python/...`, so `source .venv/bin/activate` works directly after a restart.
 
-## 3. W&B auth
+## 2. W&B auth
 ```bash
 export WANDB_API_KEY=$(tr -d '[:space:]' < ~/.wandb_personal_key)
 ```
 
-## 4. Train (in tmux)
+## 3. Train (detached with setsid, survives the shell)
 ```bash
-tmux new-session -d -s train
-tmux send-keys -t train 'source .venv/bin/activate && \
+cd /workspace/pusht-slim
+setsid bash -c 'source .venv/bin/activate && \
   export WANDB_API_KEY=$(tr -d "[:space:]" < ~/.wandb_personal_key) && \
   export SDL_VIDEODRIVER=dummy && \
-  python -u train.py 2>&1 | tee train.log' Enter
+  exec python -u train.py' > train.log 2>&1 < /dev/null & disown
+tail -f train.log
 ```
+- `setsid ... & disown`: the run gets its own session, detached from the shell.
 - `SDL_VIDEODRIVER=dummy`: headless pygame for eval rollouts.
 - `python -u`: unbuffered output so `train.log` is live.
