@@ -22,8 +22,7 @@ ACTION_CHUNK_SIZE = 8
 N_DENOISING_STEPS = 10
 DATASET_ID = "lerobot/pusht"
 # DiT sized to ~200M: hidden 896, 12 layers, 8 heads. Model scale was the
-# dominant success-rate lever in the experiment rounds (EXPERIMENTS.md on the
-# feat/zaringleb/claude-flow-experiments branch): ~47M plateaued at SR ~0.5,
+# dominant success-rate lever in our experiments: ~47M plateaued at SR ~0.5,
 # 200M reaches ~0.6-0.7.
 N_HEADS = 8
 N_LAYERS = 12
@@ -32,10 +31,7 @@ TOTAL_STEPS = 100_000
 LR = 1e-4
 WARMUP_STEPS = 500   # linear LR warmup
 LR_MIN = 1e-6        # cosine decay floor
-# Gradient clipping a la nanoGPT. torch.nn.utils.clip_grad_norm_ returns the
-# total pre-clip grad norm, which we log to watch for instability. Set to a
-# float (nanoGPT uses 1.0) to also clip; None measures the norm without clipping.
-GRAD_CLIP = None
+GRAD_CLIP = 10.0  # max grad norm; the pre-clip norm is logged to watch for instability
 LOG_EVERY = 200
 EVAL_EVERY = 10_000
 EVAL_EPISODES = 50  # SR noise at 20 episodes was +-0.11; 50 brings it to ~+-0.07
@@ -57,9 +53,9 @@ WANDB_ENTITY = "robot_learning_collective"
 # so it lives at the same scale as the Gaussian noise used by flow matching,
 # then unnormalize the model's output before sending it back to the env.
 COORD_MIN, COORD_MAX = 0.0, 512.0
-# PushT frames are 96x96. lerobot-style: crop at native resolution (no upsample)
-# and let SpatialSoftmax pool the small feature map (see ImageEncoder).
-NATIVE_IMG_SIZE = 96
+# PushT frames are 96x96; crop at native resolution (no upsample) and let
+# SpatialSoftmax pool the small feature map (see ImageEncoder).
+BACKBONE = "dinov2_vits14"  # DINOv2 ViT-S/14, self-supervised pretrained
 CROP_SIZE = 84  # random crop (train) / center crop (eval), ~0.875 of native
 NUM_KEYPOINTS = 32  # SpatialSoftmax keypoints
 IMG_MEAN = [0.485, 0.456, 0.406]
@@ -100,10 +96,9 @@ class PushTAdapter:
         return unnormalize(actions).squeeze(0).cpu().numpy()
 
 
-def evaluate(policy, device, n_episodes, render, n_steps, n_videos=0):
-    render_mode = "human" if render else "rgb_array"
+def evaluate(policy, device, n_episodes=EVAL_EPISODES, n_videos=EVAL_VIDEOS):
     env = gym.make(
-        "gym_pusht/PushT-v0", obs_type="pixels_agent_pos", render_mode=render_mode
+        "gym_pusht/PushT-v0", obs_type="pixels_agent_pos", render_mode="rgb_array"
     )
     adapter = PushTAdapter(device)
     policy.eval()
@@ -115,14 +110,14 @@ def evaluate(policy, device, n_episodes, render, n_steps, n_videos=0):
         obs, _ = env.reset()
         done = False
         max_reward = -float("inf")
-        frames = [env.render()]  # 680x680 rgb_array (None in human mode)
+        frames = [env.render()]  # 680x680 rgb_array
 
         info = {}
         while not done:
             images_in, states_in = adapter.observe(obs)
 
             # Predict a full action horizon, then map it back to env actions.
-            actions = policy.inference(images_in, states_in, n_steps=n_steps)
+            actions = policy.inference(images_in, states_in)
             actions = adapter.act(actions)
 
             # Receding horizon: execute one chunk, then replan from the new state.
@@ -130,8 +125,6 @@ def evaluate(policy, device, n_episodes, render, n_steps, n_videos=0):
                 obs, reward, terminated, truncated, info = env.step(action)
                 max_reward = max(max_reward, float(reward))
                 frames.append(env.render())
-                if render:
-                    time.sleep(0.05)
                 done = terminated or truncated
                 if done:
                     break
@@ -220,62 +213,51 @@ class PushTDataset(Dataset):
         actions[:n] = self.actions[idx : idx + n]
         mask[:n] = 1.0
 
-        return self.images[idx], self.states[idx], actions.flatten(), mask.flatten()
+        return self.images[idx], self.states[idx], actions, mask
 
 # =============================================================================
 # 3. Model
 # =============================================================================
 class SpatialSoftmax(nn.Module):
-    """Spatial soft-argmax pooling (Finn et al. 2015), ported from lerobot/robomimic.
+    """Spatial soft-argmax pooling (Finn et al. 2015).
 
     Turns a (B, C, H, W) feature map into (B, K, 2) keypoint coordinates: the
     softmax-weighted "center of mass" of each channel's activations. Unlike global
     average pooling, this preserves *where* features fire, so it stays informative
-    even on the tiny feature maps a stock ResNet produces from small inputs (an
-    84x84 crop -> 512x3x3). A 1x1 conv first remaps C -> num_kp keypoint channels.
+    even on tiny feature maps. A 1x1 conv first remaps C -> num_kp keypoint channels.
     """
 
-    def __init__(self, input_shape, num_kp=None):
+    def __init__(self, input_shape, num_kp):
         super().__init__()
-        self._in_c, self._in_h, self._in_w = input_shape
-        if num_kp is not None:
-            self.nets = nn.Conv2d(self._in_c, num_kp, kernel_size=1)
-            self._out_c = num_kp
-        else:
-            self.nets = None
-            self._out_c = self._in_c
+        in_c, h, w = input_shape
+        self.conv = nn.Conv2d(in_c, num_kp, kernel_size=1)
 
-        pos_x, pos_y = np.meshgrid(
-            np.linspace(-1.0, 1.0, self._in_w), np.linspace(-1.0, 1.0, self._in_h)
+        pos_y, pos_x = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, h), torch.linspace(-1.0, 1.0, w), indexing="ij"
         )
-        pos_x = torch.from_numpy(pos_x.reshape(self._in_h * self._in_w, 1)).float()
-        pos_y = torch.from_numpy(pos_y.reshape(self._in_h * self._in_w, 1)).float()
-        self.register_buffer("pos_grid", torch.cat([pos_x, pos_y], dim=1))
+        pos_grid = torch.stack([pos_x.flatten(), pos_y.flatten()], dim=1)  # (H*W, 2)
+        self.register_buffer("pos_grid", pos_grid)
 
     def forward(self, features):
-        if self.nets is not None:
-            features = self.nets(features)
-        batch = features.shape[0]
-        features = features.reshape(-1, self._in_h * self._in_w)
-        attention = F.softmax(features, dim=-1)
-        keypoints = attention @ self.pos_grid  # (B * out_c, 2)
-        return keypoints.reshape(batch, self._out_c, 2)
+        features = self.conv(features)  # (B, num_kp, H, W)
+        attention = F.softmax(features.flatten(2), dim=-1)  # (B, num_kp, H*W)
+        return attention @ self.pos_grid  # (B, num_kp, 2)
 
 
 class ImageEncoder(nn.Module):
     """Vision encoder: DINOv2 ViT-S/14 (self-supervised pretrained), fine-tuned
-    end-to-end, replacing the from-scratch ResNet18+GN of main.
+    end-to-end.
 
     The 84x84 crop is exactly 6x14 pixels, so the ViT sees a 6x6 patch grid with
     no resizing. Its 36 patch tokens are reshaped back into a (embed_dim, 6, 6)
-    feature map and pooled by the same SpatialSoftmax -> keypoints -> linear
-    pipeline main uses, so only the backbone changes. Cropping lives here
-    (random in train, center in eval) so train and eval share a single code path.
+    feature map and pooled by SpatialSoftmax -> keypoints -> linear. Cropping
+    lives here (random in train, center in eval) so train and eval share a
+    single code path.
     """
 
     def __init__(self, out_dim, crop_size=CROP_SIZE, num_kp=NUM_KEYPOINTS):
         super().__init__()
-        self.backbone = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
+        self.backbone = torch.hub.load("facebookresearch/dinov2", BACKBONE)
         self.patch_size = self.backbone.patch_size  # 14
         assert crop_size % self.patch_size == 0, "crop must be a multiple of the ViT patch size"
         self._grid = crop_size // self.patch_size  # 6
@@ -336,16 +318,17 @@ class StateEncoder(nn.Module):
 class TimestepEncoder(nn.Module):
     def __init__(self, out_dim):
         super().__init__()
-        self.out_dim = out_dim
         self.mlp = nn.Sequential(
             nn.Linear(out_dim, out_dim * 4), nn.GELU(), nn.Linear(out_dim * 4, out_dim)
+        )
+        half = out_dim // 2
+        self.register_buffer(
+            "freqs", torch.exp(-math.log(10000) * torch.arange(half) / half)
         )
 
     def forward(self, t):
         # t: (batch,)
-        half = self.out_dim // 2
-        freqs = torch.exp(-math.log(10000) * torch.arange(half) / half).to(t.device)
-        x = t[:, None] * freqs[None, :]  # (batch, half)
+        x = t[:, None] * self.freqs[None, :]  # (batch, half)
         x = torch.cat([torch.sin(x), torch.cos(x)], dim=-1)  # (batch, out_dim)
         return self.mlp(x)
 
@@ -434,29 +417,29 @@ class DiTPolicy(nn.Module):
 
         x = self.action_proj(x_t)
         x = x + self.action_pos_emb
-        
+
         for block in self.blocks:
             x = block(x, cond)
         return self.action_out(x)
 
     @torch.no_grad()
     def inference(self, images, obs, n_steps=N_DENOISING_STEPS):
-        batch_size = images.shape[0]
-        x = torch.randn(batch_size, PREDICTION_HORIZON, ROBOT_DOF).to(images.device)
+        batch_size, device = images.shape[0], images.device
+        x = torch.randn(batch_size, PREDICTION_HORIZON, ROBOT_DOF, device=device)
 
         dt = 1.0 / n_steps
         for i in range(n_steps):
-            t = torch.full((batch_size,), i / n_steps).to(images.device)
+            t = torch.full((batch_size,), i / n_steps, device=device)
             v = self.forward(x, t, images, obs)
             x = x + v * dt
-        return x.clamp(-1.0, 1.0) 
+        return x.clamp(-1.0, 1.0)
 
 
 # =============================================================================
 # 4. Training
 # =============================================================================
-def save_checkpoint(policy, optimizer, scheduler, global_step, loss, checkpoint_dir):
-    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_step_{global_step}.pt")
+def save_checkpoint(policy, optimizer, scheduler, global_step, loss):
+    checkpoint_path = os.path.join(CHECKPOINT_DIR, f"checkpoint_step_{global_step}.pt")
 
     # torch.compile wraps the model and stores the real model in _orig_mod.
     # Save the real model so checkpoint keys match a normal, uncompiled model.
@@ -479,15 +462,12 @@ def save_checkpoint(policy, optimizer, scheduler, global_step, loss, checkpoint_
 # must live outside forward. A method would route through the uncompiled
 # self.forward, making the compile a no-op.
 def flow_matching_loss(policy, images, obs, actions, masks):
-    B = actions.shape[0]
-    actions = actions.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
-    masks = masks.reshape(B, PREDICTION_HORIZON, ROBOT_DOF)
-
-    t = torch.rand(B, device=actions.device)
+    # actions, masks: (batch, PREDICTION_HORIZON, ROBOT_DOF)
+    t = torch.rand(len(actions), device=actions.device)
     noise = torch.randn_like(actions)
     x_t = (1 - t[:, None, None]) * noise + t[:, None, None] * actions
     v_pred = policy(x_t, t, images, obs)
-    loss = nn.functional.mse_loss(v_pred, actions - noise, reduction="none")
+    loss = F.mse_loss(v_pred, actions - noise, reduction="none")
     # Masked mean over valid (in-episode) timesteps. Averaging — rather than
     # summing over the horizon — keeps the loss on the same scale as an unmasked
     # mean, so it's comparable across runs and doesn't inflate the effective
@@ -495,16 +475,7 @@ def flow_matching_loss(policy, images, obs, actions, masks):
     return (loss * masks).sum() / masks.sum().clamp(min=1)
 
 
-def train(
-    policy,
-    dataloader,
-    total_steps=TOTAL_STEPS,
-    lr=LR,
-    log_every=LOG_EVERY,
-    eval_every=EVAL_EVERY,
-    save_every=SAVE_EVERY,
-    checkpoint_dir=CHECKPOINT_DIR,
-):
+def train(policy, dataloader):
     device = torch.device("cuda")
 
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -514,21 +485,20 @@ def train(
     policy = policy.to(device)
     policy = torch.compile(policy)
 
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=LR, weight_decay=1e-4)
 
     # Linear warmup then cosine decay to LR_MIN (lerobot-style schedule).
     def lr_lambda(step):
         if step < WARMUP_STEPS:
             return (step + 1) / WARMUP_STEPS
-        progress = (step - WARMUP_STEPS) / max(1, total_steps - WARMUP_STEPS)
+        progress = (step - WARMUP_STEPS) / max(1, TOTAL_STEPS - WARMUP_STEPS)
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return LR_MIN / lr + (1.0 - LR_MIN / lr) * cosine
+        return LR_MIN / LR + (1.0 - LR_MIN / LR) * cosine
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
     last_loss = 0.0
-    global_step = 0
     dataloader_iter = iter(dataloader)
 
     # Rolling per-step timers (reset each log window) so we can see whether we're
@@ -539,7 +509,7 @@ def train(
     data_time = 0.0
     compute_time = 0.0
 
-    for global_step in range(1, total_steps + 1):
+    for global_step in range(1, TOTAL_STEPS + 1):
         t_data_start = time.perf_counter()
         try:
             batch = next(dataloader_iter)
@@ -556,12 +526,8 @@ def train(
             loss = flow_matching_loss(policy, images, obs, actions, mask)
         optimizer.zero_grad()
         loss.backward()
-        # nanoGPT-style: clip_grad_norm_ returns the total grad norm pre-clip.
-        # max_norm=inf measures without actually clipping (GRAD_CLIP=None).
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            policy.parameters(),
-            max_norm=GRAD_CLIP if GRAD_CLIP is not None else float("inf"),
-        )
+        # clip_grad_norm_ returns the total grad norm pre-clip
+        grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), GRAD_CLIP)
         optimizer.step()
         scheduler.step()
 
@@ -574,9 +540,9 @@ def train(
         # collect everything due on this step into one log call so wandb sees
         # a single record per step (log and eval cadences can coincide)
         log_dict = {}
-        if global_step % log_every == 0:
-            data_ms = data_time / log_every * 1e3
-            compute_ms = compute_time / log_every * 1e3
+        if global_step % LOG_EVERY == 0:
+            data_ms = data_time / LOG_EVERY * 1e3
+            compute_ms = compute_time / LOG_EVERY * 1e3
             step_ms = data_ms + compute_ms
             it_per_s = 1e3 / step_ms if step_ms > 0 else 0.0
             grad_norm_val = grad_norm.item()
@@ -595,34 +561,22 @@ def train(
             data_time = 0.0
             compute_time = 0.0
 
-        if global_step % eval_every == 0:
-            log_dict.update(evaluate(
-                policy, device, n_episodes=EVAL_EPISODES, render=False,
-                n_steps=N_DENOISING_STEPS, n_videos=EVAL_VIDEOS,
-            ))
+        if global_step % EVAL_EVERY == 0:
+            log_dict.update(evaluate(policy, device))
 
         if log_dict:
             wandb.log(log_dict, step=global_step)
 
-        if global_step % save_every == 0:
-            save_checkpoint(
-                policy, optimizer, scheduler, global_step, last_loss, checkpoint_dir
-            )
+        if global_step % SAVE_EVERY == 0:
+            save_checkpoint(policy, optimizer, scheduler, global_step, last_loss)
 
     # final eval + checkpoint, unless the last step already triggered them
-    final_dict = {}
-    if total_steps % eval_every != 0:
-        final_dict.update(evaluate(
-            policy, device, n_episodes=EVAL_EPISODES, render=False,
-            n_steps=N_DENOISING_STEPS, n_videos=EVAL_VIDEOS,
-        ))
-    if final_dict:
-        wandb.log(final_dict, step=global_step)
-    if total_steps % save_every != 0:
-        save_checkpoint(policy, optimizer, scheduler, global_step, last_loss, checkpoint_dir)
+    if TOTAL_STEPS % EVAL_EVERY != 0:
+        wandb.log(evaluate(policy, device), step=global_step)
+    if TOTAL_STEPS % SAVE_EVERY != 0:
+        save_checkpoint(policy, optimizer, scheduler, global_step, last_loss)
 
 def main():
-
     policy = DiTPolicy()
     dataset = PushTDataset(
         dataset_id=DATASET_ID,
@@ -644,36 +598,15 @@ def main():
         f"(~{math.ceil(TOTAL_STEPS / steps_per_epoch)} passes over the data)"
     )
 
-    wandb.init(
-        project=WANDB_PROJECT,
-        entity=WANDB_ENTITY,
-        name=RUN_NAME,
-        config={
-            "total_steps": TOTAL_STEPS,
-            "steps_per_epoch": steps_per_epoch,
-            "log_every": LOG_EVERY,
-            "eval_every": EVAL_EVERY,
-            "eval_episodes": EVAL_EPISODES,
-            "save_every": SAVE_EVERY,
-            "lr": LR,
-            "warmup_steps": WARMUP_STEPS,
-            "lr_min": LR_MIN,
-            "n_layers": N_LAYERS,
-            "n_heads": N_HEADS,
-            "hidden_dim": HIDDEN_DIM,
-            "backbone": "dinov2-vits14-pretrained",
-            "pooling": "spatial_softmax",
-            "crop_size": CROP_SIZE,
-            "num_keypoints": NUM_KEYPOINTS,
-            "robot_dof": ROBOT_DOF,
-            "prediction_horizon": PREDICTION_HORIZON,
-            "action_chunk_size": ACTION_CHUNK_SIZE,
-            "n_denoising_steps": N_DENOISING_STEPS,
-            "batch_size": BATCH_SIZE,
-        },
-    )
+    # the run config is every UPPERCASE scalar/string constant above (nanoGPT-style)
+    config = {
+        k: v for k, v in globals().items()
+        if k.isupper() and isinstance(v, (int, float, str))
+    }
+    config["steps_per_epoch"] = steps_per_epoch
+    wandb.init(project=WANDB_PROJECT, entity=WANDB_ENTITY, name=RUN_NAME, config=config)
 
-    train(policy=policy, dataloader=dataloader)
+    train(policy, dataloader)
 
     wandb.finish()
 
