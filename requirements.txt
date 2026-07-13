@@ -6,5 +6,6 @@ pyarrow
 gym-pusht==0.1.6
 pymunk==6.6.0
 wandb
+moviepy  # wandb.Video mp4 encoding for eval rollout videos
 imageio
 tqdm

@@ -39,6 +39,7 @@ GRAD_CLIP = None
 LOG_EVERY = 200
 EVAL_EVERY = 10_000
 EVAL_EPISODES = 50  # SR noise at 20 episodes was +-0.11; 50 brings it to ~+-0.07
+EVAL_VIDEOS = 3     # rollout videos logged to wandb per eval
 SAVE_EVERY = 25_000
 RUN_NAME = f"exp-dinov2-vits14-200m-100k-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 CHECKPOINT_DIR = f"checkpoints_{RUN_NAME}"
@@ -99,7 +100,7 @@ class PushTAdapter:
         return unnormalize(actions).squeeze(0).cpu().numpy()
 
 
-def evaluate(policy, device, n_episodes, render, n_steps):
+def evaluate(policy, device, n_episodes, render, n_steps, n_videos=0):
     render_mode = "human" if render else "rgb_array"
     env = gym.make(
         "gym_pusht/PushT-v0", obs_type="pixels_agent_pos", render_mode=render_mode
@@ -109,10 +110,12 @@ def evaluate(policy, device, n_episodes, render, n_steps):
 
     successes = 0
     max_rewards = []
+    videos = []  # (T, H, W, C) uint8 render frames of the first n_videos episodes
     for episode in range(n_episodes):
         obs, _ = env.reset()
         done = False
         max_reward = -float("inf")
+        frames = [env.render()]  # 680x680 rgb_array (None in human mode)
 
         info = {}
         while not done:
@@ -126,6 +129,7 @@ def evaluate(policy, device, n_episodes, render, n_steps):
             for action in actions[:ACTION_CHUNK_SIZE]:
                 obs, reward, terminated, truncated, info = env.step(action)
                 max_reward = max(max_reward, float(reward))
+                frames.append(env.render())
                 if render:
                     time.sleep(0.05)
                 done = terminated or truncated
@@ -135,13 +139,23 @@ def evaluate(policy, device, n_episodes, render, n_steps):
         if info.get("is_success", False):
             successes += 1
         max_rewards.append(max_reward)
+        if episode < n_videos:
+            videos.append(np.stack(frames))
 
+    fps = env.metadata["render_fps"]
     env.close()
     policy.train()
     metrics = {
         "success_rate": successes / n_episodes,
         "avg_max_reward": sum(max_rewards) / n_episodes,
     }
+    if videos:
+        # All videos under one key -> one wandb panel (a key per video makes
+        # one panel per video). wandb.Video wants (T, C, H, W).
+        metrics["eval_videos"] = [
+            wandb.Video(v.transpose(0, 3, 1, 2), fps=fps, format="mp4")
+            for v in videos
+        ]
     print(
         f"[eval] success_rate={metrics['success_rate']:.3f} "
         f"avg_max_reward={metrics['avg_max_reward']:.3f} (n_episodes={n_episodes})"
@@ -584,7 +598,7 @@ def train(
         if global_step % eval_every == 0:
             log_dict.update(evaluate(
                 policy, device, n_episodes=EVAL_EPISODES, render=False,
-                n_steps=N_DENOISING_STEPS,
+                n_steps=N_DENOISING_STEPS, n_videos=EVAL_VIDEOS,
             ))
 
         if log_dict:
@@ -600,7 +614,7 @@ def train(
     if total_steps % eval_every != 0:
         final_dict.update(evaluate(
             policy, device, n_episodes=EVAL_EPISODES, render=False,
-            n_steps=N_DENOISING_STEPS,
+            n_steps=N_DENOISING_STEPS, n_videos=EVAL_VIDEOS,
         ))
     if final_dict:
         wandb.log(final_dict, step=global_step)
