@@ -36,22 +36,19 @@ LOG_EVERY = 200
 EVAL_EVERY = 10_000
 EVAL_EPISODES = 50  # SR noise at 20 episodes was +-0.11; 50 brings it to ~+-0.07
 EVAL_VIDEOS = 3     # rollout videos logged to wandb per eval
-SAVE_EVERY = 25_000
+SAVE_EVERY = 20_000
 RUN_NAME = f"exp-dinov2-vits14-200m-100k-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 CHECKPOINT_DIR = f"checkpoints_{RUN_NAME}"
 BATCH_SIZE = 512
-# Background dataloader workers. With num_workers=0 the loader runs in the train
-# process and each step blocks on CPU collation, which (with the GPU step at
-# ~27ms) makes training data-loading bound. A few workers prefetch batches so
-# the GPU step becomes the bottleneck.
-NUM_WORKERS = 8
+NUM_WORKERS = 8  # dataloader workers
 WANDB_PROJECT = "pushT-slim"
 WANDB_ENTITY = "robot_learning_collective"
 
-# PushT positions and actions are pixel coordinates in [0, 512]
-# We normalize everything the model sees to [-1, 1]
-# so it lives at the same scale as the Gaussian noise used by flow matching,
-# then unnormalize the model's output before sending it back to the env.
+# PushT frames are uint8; positions and actions are pixel coordinates in
+# [0, 512]. The policy consumes this raw data and emits pixel-space actions —
+# all normalization lives inside the model: images are scaled to ImageNet
+# stats (see ImageEncoder), coordinates are mapped to [-1, 1] so they live at
+# the same scale as the Gaussian noise used by flow matching.
 COORD_MIN, COORD_MAX = 0.0, 512.0
 # PushT frames are 96x96; crop at native resolution (no upsample) and let
 # SpatialSoftmax pool the small feature map (see ImageEncoder).
@@ -72,35 +69,10 @@ def unnormalize(x):
 # =============================================================================
 # 1. Environment
 # =============================================================================
-class PushTAdapter:
-    """Translates between the PushT env and the policy.
-
-    Keeps all PushT/coordinate specifics (obs layout, normalization, tensor
-    plumbing) in one place so the eval loop can stay env-agnostic: it only
-    sees model-ready tensors going in and env-ready actions coming out.
-    """
-
-    def __init__(self, device):
-        self.device = device
-
-    def observe(self, obs):
-        # env obs dict -> batched, normalized (images, states) on device.
-        # Feed the raw native-resolution frame; the encoder owns cropping (center
-        # crop in eval, random crop in train) so train and eval share one path.
-        image = torch.from_numpy(obs["pixels"]).permute(2, 0, 1).float() / 255.0
-        state = normalize(torch.from_numpy(obs["agent_pos"]).float())
-        return image.unsqueeze(0).to(self.device), state.unsqueeze(0).to(self.device)
-
-    def act(self, actions):
-        # policy output in [-1, 1] -> env actions in [0, 512]
-        return unnormalize(actions).squeeze(0).cpu().numpy()
-
-
 def evaluate(policy, device, n_episodes=EVAL_EPISODES, n_videos=EVAL_VIDEOS):
     env = gym.make(
         "gym_pusht/PushT-v0", obs_type="pixels_agent_pos", render_mode="rgb_array"
     )
-    adapter = PushTAdapter(device)
     policy.eval()
 
     successes = 0
@@ -114,11 +86,14 @@ def evaluate(policy, device, n_episodes=EVAL_EPISODES, n_videos=EVAL_VIDEOS):
 
         info = {}
         while not done:
-            images_in, states_in = adapter.observe(obs)
-
-            # Predict a full action horizon, then map it back to env actions.
-            actions = policy.inference(images_in, states_in)
-            actions = adapter.act(actions)
+            # env obs dict -> batched tensors on device; the policy takes raw
+            # uint8 frames and pixel-space state, and returns pixel-space actions
+            image = torch.from_numpy(obs["pixels"]).permute(2, 0, 1)  # HWC -> CHW
+            state = torch.from_numpy(obs["agent_pos"]).float()
+            actions = policy.inference(
+                image[None].to(device), state[None].to(device)
+            )
+            actions = actions.squeeze(0).cpu().numpy()
 
             # Receding horizon: execute one chunk, then replan from the new state.
             for action in actions[:ACTION_CHUNK_SIZE]:
@@ -166,7 +141,8 @@ class PushTDataset(Dataset):
     every episode concatenated in order, and one parquet with the matching
     per-frame state/action/episode metadata (row i <-> video frame i). We
     decode the whole video once up front (~7s) and keep everything in RAM
-    (~2.8 GB), so __getitem__ is pure tensor slicing.
+    (~0.7 GB as uint8), so __getitem__ is pure tensor slicing. Data is served
+    raw; the model owns all normalization.
     """
 
     def __init__(self, dataset_id, prediction_horizon):
@@ -191,11 +167,9 @@ class PushTDataset(Dataset):
         print(f"Done: {len(frames)} frames.")
 
         self.prediction_horizon = prediction_horizon
-        # Raw native-resolution frames in [0, 1]. Cropping and normalization
-        # happen inside the encoder so train/eval stay in sync.
-        self.images = frames.float().div_(255.0)
-        self.states = normalize(states)
-        self.actions = normalize(actions)
+        self.images = frames  # uint8, native resolution
+        self.states = states
+        self.actions = actions
         self.episode_ids = episode_ids
 
     def __len__(self):
@@ -289,7 +263,8 @@ class ImageEncoder(nn.Module):
         return images[:, :, rows[:, None], cols[None, :]]
 
     def forward(self, images):
-        # images: (batch, 3, 96, 96) in [0, 1]
+        # images: (batch, 3, 96, 96) uint8
+        images = images.float() / 255.0
         images = self.random_crop(images) if self.training else self.center_crop(images)
         images = (images - self.img_mean) / self.img_std
 
@@ -309,8 +284,8 @@ class StateEncoder(nn.Module):
         )
 
     def forward(self, state):
-        # state: (batch, ROBOT_DOF)
-        return self.mlp(state)
+        # state: (batch, ROBOT_DOF) in pixel coordinates
+        return self.mlp(normalize(state))
 
 
 # turns the scalar flow-time t into a vector "fingerprint" the network can use,
@@ -407,8 +382,8 @@ class DiTPolicy(nn.Module):
 
     def forward(self, x_t, t, images, obs):
         # pure network: noisy actions + time + context -> predicted velocity
-        # x_t: (batch, PREDICTION_HORIZON, ROBOT_DOF), t: (batch,)
-        # images: (batch, 3, 96, 96), obs: (batch, ROBOT_DOF)
+        # x_t: (batch, PREDICTION_HORIZON, ROBOT_DOF) in [-1, 1], t: (batch,)
+        # images: (batch, 3, 96, 96) uint8, obs: (batch, ROBOT_DOF) in pixels
         images_cond = self.image_encoder(images)
         obs_cond = self.state_encoder(obs)
         timestep_cond = self.timestep_encoder(t)
@@ -432,7 +407,7 @@ class DiTPolicy(nn.Module):
             t = torch.full((batch_size,), i / n_steps, device=device)
             v = self.forward(x, t, images, obs)
             x = x + v * dt
-        return x.clamp(-1.0, 1.0)
+        return unnormalize(x.clamp(-1.0, 1.0))  # -> pixel-space actions
 
 
 # =============================================================================
@@ -462,7 +437,8 @@ def save_checkpoint(policy, optimizer, scheduler, global_step, loss):
 # must live outside forward. A method would route through the uncompiled
 # self.forward, making the compile a no-op.
 def flow_matching_loss(policy, images, obs, actions, masks):
-    # actions, masks: (batch, PREDICTION_HORIZON, ROBOT_DOF)
+    # actions, masks: (batch, PREDICTION_HORIZON, ROBOT_DOF); actions in pixels
+    actions = normalize(actions)  # the flow runs at noise scale, in [-1, 1]
     t = torch.rand(len(actions), device=actions.device)
     noise = torch.randn_like(actions)
     x_t = (1 - t[:, None, None]) * noise + t[:, None, None] * actions
