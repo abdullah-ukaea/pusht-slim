@@ -192,32 +192,6 @@ class PushTDataset(Dataset):
 # =============================================================================
 # 3. Model
 # =============================================================================
-class SpatialSoftmax(nn.Module):
-    """Spatial soft-argmax pooling (Finn et al. 2015).
-
-    Turns a (B, C, H, W) feature map into (B, K, 2) keypoint coordinates: the
-    softmax-weighted "center of mass" of each channel's activations. Unlike global
-    average pooling, this preserves *where* features fire, so it stays informative
-    even on tiny feature maps. A 1x1 conv first remaps C -> num_kp keypoint channels.
-    """
-
-    def __init__(self, input_shape, num_kp):
-        super().__init__()
-        in_c, h, w = input_shape
-        self.conv = nn.Conv2d(in_c, num_kp, kernel_size=1)
-
-        pos_y, pos_x = torch.meshgrid(
-            torch.linspace(-1.0, 1.0, h), torch.linspace(-1.0, 1.0, w), indexing="ij"
-        )
-        pos_grid = torch.stack([pos_x.flatten(), pos_y.flatten()], dim=1)  # (H*W, 2)
-        self.register_buffer("pos_grid", pos_grid)
-
-    def forward(self, features):
-        features = self.conv(features)  # (B, num_kp, H, W)
-        attention = F.softmax(features.flatten(2), dim=-1)  # (B, num_kp, H*W)
-        return attention @ self.pos_grid  # (B, num_kp, 2)
-
-
 class ImageEncoder(nn.Module):
     """Vision encoder: DINOv2 ViT-S/14 (self-supervised pretrained), fine-tuned
     end-to-end.
@@ -246,10 +220,8 @@ class ImageEncoder(nn.Module):
         # CUDA sync + a torch.compile graph break at the top of the model.
         self.crop_size = crop_size
         self.center_crop = T.CenterCrop(crop_size)
-
-        feat_shape = (self.backbone.embed_dim, self._grid, self._grid)
-        self.pool = SpatialSoftmax(feat_shape, num_kp=num_kp)
-        self.fc = nn.Linear(num_kp * 2, out_dim)
+        
+        self.fc = nn.Linear(self.backbone.embed_dim, out_dim)
 
     def random_crop(self, images):
         # One random crop window for the whole batch, expressed entirely in
@@ -270,9 +242,7 @@ class ImageEncoder(nn.Module):
 
         # (B, 36, embed_dim) patch tokens -> (B, embed_dim, 6, 6) feature map
         tokens = self.backbone.forward_features(images)["x_norm_patchtokens"]
-        b, n, c = tokens.shape
-        x = tokens.transpose(1, 2).reshape(b, c, self._grid, self._grid)
-        x = self.pool(x).flatten(1)  # (batch, num_kp * 2)
+        x = tokens.mean(dim=1)
         return self.fc(x)
 
 
