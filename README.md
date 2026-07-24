@@ -7,7 +7,7 @@ The policy is a ~200M-parameter [DiT](https://arxiv.org/abs/2212.09748) trained 
 ## How it works
 
 - **Data** — the hub dataset is just an MP4 (every frame of every episode, concatenated) plus a parquet with per-frame state/action/episode metadata. `PushTDataset` decodes the video once (~7 s) and keeps everything in RAM (~0.7 GB as uint8), so `__getitem__` is pure tensor slicing. Data is served raw — the model owns all normalization. No lerobot dependency.
-- **Observation encoding** — frames are cropped to 84×84 (random in train, center in eval) and passed through a pretrained DINOv2 ViT-S/14, fine-tuned end-to-end. Its 6×6 patch grid is pooled by SpatialSoftmax into 32 keypoints. The 2-DoF robot state goes through a small MLP.
+- **Observation encoding** — frames are cropped to 84×84 (random in train, center in eval) and passed through a pretrained DINOv2 ViT-S/14, fine-tuned end-to-end. Its 6×6 patch grid is mean-pooled into a feature vector. The 2-DoF robot state goes through a small MLP.
 - **Action generation** — a DiT with adaLN conditioning (image + state + flow time) predicts the velocity field of a flow from Gaussian noise to a 16-step action chunk. Inference is 10 Euler steps.
 - **Control** — receding horizon: predict 16 actions, execute 8, replan.
 - **Eval** — every 10k steps the policy is rolled out in `gym-pusht` for 50 episodes; success rate, average max reward, and 3 rollout videos are logged to wandb.

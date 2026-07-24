@@ -50,11 +50,10 @@ WANDB_ENTITY = "robot_learning_collective"
 # stats (see ImageEncoder), coordinates are mapped to [-1, 1] so they live at
 # the same scale as the Gaussian noise used by flow matching.
 COORD_MIN, COORD_MAX = 0.0, 512.0
-# PushT frames are 96x96; crop at native resolution (no upsample) and let
-# SpatialSoftmax pool the small feature map (see ImageEncoder).
+# PushT frames are 96x96; crop at native resolution (no upsample) and
+# mean-pool the DINOv2 patch tokens (see ImageEncoder).
 BACKBONE = "dinov2_vits14"  # DINOv2 ViT-S/14, self-supervised pretrained
 CROP_SIZE = 84  # random crop (train) / center crop (eval), ~0.875 of native
-NUM_KEYPOINTS = 32  # SpatialSoftmax keypoints
 IMG_MEAN = [0.485, 0.456, 0.406]
 IMG_STD = [0.229, 0.224, 0.225]
 
@@ -197,13 +196,12 @@ class ImageEncoder(nn.Module):
     end-to-end.
 
     The 84x84 crop is exactly 6x14 pixels, so the ViT sees a 6x6 patch grid with
-    no resizing. Its 36 patch tokens are reshaped back into a (embed_dim, 6, 6)
-    feature map and pooled by SpatialSoftmax -> keypoints -> linear. Cropping
-    lives here (random in train, center in eval) so train and eval share a
-    single code path.
+    no resizing. Its 36 patch tokens are mean-pooled and passed through a linear
+    layer. Cropping lives here (random in train, center in eval) so train and
+    eval share a single code path.
     """
 
-    def __init__(self, out_dim, crop_size=CROP_SIZE, num_kp=NUM_KEYPOINTS):
+    def __init__(self, out_dim, crop_size=CROP_SIZE):
         super().__init__()
         self.backbone = torch.hub.load("facebookresearch/dinov2", BACKBONE)
         self.patch_size = self.backbone.patch_size  # 14
