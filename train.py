@@ -350,12 +350,12 @@ class DiTPolicy(nn.Module):
             ]
         )
 
-    def forward(self, x_t, t, images, obs):
-        # pure network: noisy actions + time + context -> predicted velocity
-        # x_t: (batch, PREDICTION_HORIZON, ROBOT_DOF) in [-1, 1], t: (batch,)
-        # images: (batch, 3, 96, 96) uint8, obs: (batch, ROBOT_DOF) in pixels
+    def encode_observation(self, images, obs):
         images_cond = self.image_encoder(images)
         obs_cond = self.state_encoder(obs)
+        return images_cond, obs_cond
+
+    def vector_field(self, x_t, t, images_cond, obs_cond):
         timestep_cond = self.timestep_encoder(t)
         cond = torch.cat([images_cond, obs_cond, timestep_cond], dim=-1)
         cond = self.cond_proj(cond)
@@ -367,15 +367,23 @@ class DiTPolicy(nn.Module):
             x = block(x, cond)
         return self.action_out(x)
 
+    def forward(self, x_t, t, images, obs):
+        # pure network: noisy actions + time + context -> predicted velocity
+        # x_t: (batch, PREDICTION_HORIZON, ROBOT_DOF) in [-1, 1], t: (batch,)
+        # images: (batch, 3, 96, 96) uint8, obs: (batch, ROBOT_DOF) in pixels
+        images_cond, obs_cond = self.encode_observation(images, obs)
+        return self.vector_field(x_t, t, images_cond, obs_cond)
+
     @torch.no_grad()
     def inference(self, images, obs, n_steps=N_DENOISING_STEPS):
         batch_size, device = images.shape[0], images.device
         x = torch.randn(batch_size, PREDICTION_HORIZON, ROBOT_DOF, device=device)
+        images_cond, obs_cond = self.encode_observation(images, obs)
 
         dt = 1.0 / n_steps
         for i in range(n_steps):
             t = torch.full((batch_size,), i / n_steps, device=device)
-            v = self.forward(x, t, images, obs)
+            v = self.vector_field(x, t, images_cond, obs_cond)
             x = x + v * dt
         return unnormalize(x.clamp(-1.0, 1.0))  # -> pixel-space actions
 
