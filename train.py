@@ -305,13 +305,13 @@ class AdaLNBlock(nn.Module):
 
         # attention sub-block with adaptive LayerNorm
         x1 = self.norm1(x)
-        x1 = scale1.unsqueeze(1) * x1 + shift1.unsqueeze(1)
+        x1 = (1 + scale1.unsqueeze(1)) * x1 + shift1.unsqueeze(1)
         x1, _ = self.attention(x1, x1, x1)
         x = x + alpha1.unsqueeze(1) * x1
 
         # MLP sub-block with adaptive LayerNorm
         x2 = self.norm2(x)
-        x2 = scale2.unsqueeze(1) * x2 + shift2.unsqueeze(1)
+        x2 = (1 + scale2.unsqueeze(1)) * x2 + shift2.unsqueeze(1)
         x = x + alpha2.unsqueeze(1) * self.mlp(x2)
         return x
 
