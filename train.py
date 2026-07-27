@@ -37,7 +37,7 @@ EVAL_EVERY = 10_000
 EVAL_EPISODES = 50  # SR noise at 20 episodes was +-0.11; 50 brings it to ~+-0.07
 EVAL_VIDEOS = 3     # rollout videos logged to wandb per eval
 SAVE_EVERY = 20_000
-RUN_NAME = f"exp-dinov2-vits14-200m-100k-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+RUN_NAME = f"exp-dense-dino-fusion-200m-100k-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 CHECKPOINT_DIR = f"checkpoints_{RUN_NAME}"
 BATCH_SIZE = 512
 NUM_WORKERS = 8  # dataloader workers
@@ -50,8 +50,9 @@ WANDB_ENTITY = "robot_learning_collective"
 # stats (see ImageEncoder), coordinates are mapped to [-1, 1] so they live at
 # the same scale as the Gaussian noise used by flow matching.
 COORD_MIN, COORD_MAX = 0.0, 512.0
-# PushT frames are 96x96; crop at native resolution (no upsample) and
-# mean-pool the DINOv2 patch tokens (see ImageEncoder).
+# PushT frames are 96x96; crop at native resolution (no upsample). The DINOv2
+# patch tokens provide both the existing mean-pooled condition and dense visual
+# context for the action-token fusion block (see ImageEncoder).
 BACKBONE = "dinov2_vits14"  # DINOv2 ViT-S/14, self-supervised pretrained
 CROP_SIZE = 84  # random crop (train) / center crop (eval), ~0.875 of native
 IMG_MEAN = [0.485, 0.456, 0.406]
@@ -196,9 +197,11 @@ class ImageEncoder(nn.Module):
     end-to-end.
 
     The 84x84 crop is exactly 6x14 pixels, so the ViT sees a 6x6 patch grid with
-    no resizing. Its 36 patch tokens are mean-pooled and passed through a linear
-    layer. Cropping lives here (random in train, center in eval) so train and
-    eval share a single code path.
+    no resizing. The existing global condition is produced by mean-pooling its
+    36 patch tokens and projecting the result. The same projection is also
+    applied to every patch token so action tokens can query the dense 6x6 visual
+    representation. Cropping lives here (random in train, center in eval) so
+    train and eval share a single code path.
     """
 
     def __init__(self, out_dim, crop_size=CROP_SIZE):
@@ -238,10 +241,13 @@ class ImageEncoder(nn.Module):
         images = self.random_crop(images) if self.training else self.center_crop(images)
         images = (images - self.img_mean) / self.img_std
 
-        # (B, 36, embed_dim) patch tokens -> (B, embed_dim, 6, 6) feature map
+        # Preserve the original mean-pooled condition while also exposing all
+        # 36 spatial tokens. DINOv2's contextualized tokens already contain
+        # positional information from the ViT.
         tokens = self.backbone.forward_features(images)["x_norm_patchtokens"]
-        x = tokens.mean(dim=1)
-        return self.fc(x)
+        image_cond = self.fc(tokens.mean(dim=1))
+        patch_tokens = self.fc(tokens)
+        return image_cond, patch_tokens
 
 
 class StateEncoder(nn.Module):
@@ -274,6 +280,37 @@ class TimestepEncoder(nn.Module):
         x = t[:, None] * self.freqs[None, :]  # (batch, half)
         x = torch.cat([torch.sin(x), torch.cos(x)], dim=-1)  # (batch, out_dim)
         return self.mlp(x)
+
+
+class DensePatchFusion(nn.Module):
+    """Let action tokens query all DINOv2 patch tokens once before the DiT.
+
+    The residual gate is zero-initialized, so this branch initially preserves
+    the corrected mean-pooled baseline exactly. Unlike the former adaLN bug,
+    the normalized action query is not multiplied by a zero scale. The dense
+    attention output can therefore give the gate a useful gradient immediately,
+    allowing the branch to turn on gradually during training.
+    """
+
+    def __init__(self, hidden_dim, n_heads):
+        super().__init__()
+        self.action_norm = nn.LayerNorm(hidden_dim)
+        self.patch_norm = nn.LayerNorm(hidden_dim)
+        self.cross_attention = nn.MultiheadAttention(
+            hidden_dim, n_heads, batch_first=True
+        )
+        self.residual_gate = nn.Parameter(torch.zeros(hidden_dim))
+
+    def forward(self, action_tokens, patch_tokens):
+        normalized_patches = self.patch_norm(patch_tokens)
+        fused, _ = self.cross_attention(
+            query=self.action_norm(action_tokens),
+            key=normalized_patches,
+            value=normalized_patches,
+            need_weights=False,
+        )
+        gate = self.residual_gate.to(dtype=fused.dtype)
+        return action_tokens + gate[None, None, :] * fused
 
 
 class AdaLNBlock(nn.Module):
@@ -348,18 +385,24 @@ class DiTPolicy(nn.Module):
             ]
         )
 
-    def encode_observation(self, images, obs):
-        images_cond = self.image_encoder(images)
-        obs_cond = self.state_encoder(obs)
-        return images_cond, obs_cond
+        # A single additive dense-vision path. Keeping it outside the 12-block
+        # stack avoids turning this experiment into a much larger model-scaling
+        # change, while the zero gate makes its initial residual exactly zero.
+        self.patch_fusion = DensePatchFusion(hidden_dim, n_heads)
 
-    def vector_field(self, x_t, t, images_cond, obs_cond):
+    def encode_observation(self, images, obs):
+        image_cond, patch_tokens = self.image_encoder(images)
+        obs_cond = self.state_encoder(obs)
+        return image_cond, patch_tokens, obs_cond
+
+    def vector_field(self, x_t, t, image_cond, patch_tokens, obs_cond):
         timestep_cond = self.timestep_encoder(t)
-        cond = torch.cat([images_cond, obs_cond, timestep_cond], dim=-1)
+        cond = torch.cat([image_cond, obs_cond, timestep_cond], dim=-1)
         cond = self.cond_proj(cond)
 
         x = self.action_proj(x_t)
         x = x + self.action_pos_emb
+        x = self.patch_fusion(x, patch_tokens)
 
         for block in self.blocks:
             x = block(x, cond)
@@ -369,19 +412,19 @@ class DiTPolicy(nn.Module):
         # pure network: noisy actions + time + context -> predicted velocity
         # x_t: (batch, PREDICTION_HORIZON, ROBOT_DOF) in [-1, 1], t: (batch,)
         # images: (batch, 3, 96, 96) uint8, obs: (batch, ROBOT_DOF) in pixels
-        images_cond, obs_cond = self.encode_observation(images, obs)
-        return self.vector_field(x_t, t, images_cond, obs_cond)
+        image_cond, patch_tokens, obs_cond = self.encode_observation(images, obs)
+        return self.vector_field(x_t, t, image_cond, patch_tokens, obs_cond)
 
     @torch.no_grad()
     def inference(self, images, obs, n_steps=N_DENOISING_STEPS):
         batch_size, device = images.shape[0], images.device
         x = torch.randn(batch_size, PREDICTION_HORIZON, ROBOT_DOF, device=device)
-        images_cond, obs_cond = self.encode_observation(images, obs)
+        image_cond, patch_tokens, obs_cond = self.encode_observation(images, obs)
 
         dt = 1.0 / n_steps
         for i in range(n_steps):
             t = torch.full((batch_size,), i / n_steps, device=device)
-            v = self.vector_field(x, t, images_cond, obs_cond)
+            v = self.vector_field(x, t, image_cond, patch_tokens, obs_cond)
             x = x + v * dt
         return unnormalize(x.clamp(-1.0, 1.0))  # -> pixel-space actions
 
