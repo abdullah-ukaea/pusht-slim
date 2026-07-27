@@ -1,5 +1,6 @@
 import math
 import os
+import random
 from datetime import datetime
 import time
 
@@ -37,12 +38,13 @@ EVAL_EVERY = 10_000
 EVAL_EPISODES = 50  # SR noise at 20 episodes was +-0.11; 50 brings it to ~+-0.07
 EVAL_VIDEOS = 3     # rollout videos logged to wandb per eval
 SAVE_EVERY = 20_000
-RUN_NAME = f"exp-dense-dino-fusion-200m-100k-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
+SEED = 42
+RUN_NAME = f"adaln1-dense-dino-patch-fusion-100k-seed{SEED}-{datetime.now().strftime('%d-%m-%Y_%H-%M-%S')}"
 CHECKPOINT_DIR = f"checkpoints_{RUN_NAME}"
 BATCH_SIZE = 512
 NUM_WORKERS = 8  # dataloader workers
 WANDB_PROJECT = "pushT-slim"
-WANDB_ENTITY = "robot_learning_collective"
+WANDB_ENTITY = "theonewhomadethings"
 
 # PushT frames are uint8; positions and actions are pixel coordinates in
 # [0, 512]. The policy consumes this raw data and emits pixel-space actions —
@@ -57,6 +59,27 @@ BACKBONE = "dinov2_vits14"  # DINOv2 ViT-S/14, self-supervised pretrained
 CROP_SIZE = 84  # random crop (train) / center crop (eval), ~0.875 of native
 IMG_MEAN = [0.485, 0.456, 0.406]
 IMG_STD = [0.229, 0.224, 0.225]
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    # Prefer reproducible cuDNN kernels when they are available.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(_worker_id):
+    # DataLoader assigns each worker a deterministic torch seed from its
+    # generator. Reuse it for libraries that do not read torch's RNG state.
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
 
 def normalize(x):
     return 2.0 * (x - COORD_MIN) / (COORD_MAX - COORD_MIN) - 1.0
@@ -79,7 +102,12 @@ def evaluate(policy, device, n_episodes=EVAL_EPISODES, n_videos=EVAL_VIDEOS):
     max_rewards = []
     videos = []  # (T, H, W, C) uint8 render frames of the first n_videos episodes
     for episode in range(n_episodes):
-        obs, _ = env.reset()
+        # Give every episode its own repeatable environment state and flow-noise
+        # stream. The separate generator prevents evaluation from advancing the
+        # CUDA RNG used for training crops, flow times, and training noise.
+        episode_seed = SEED + episode
+        eval_generator = torch.Generator(device=device).manual_seed(episode_seed)
+        obs, _ = env.reset(seed=episode_seed)
         done = False
         max_reward = -float("inf")
         frames = [env.render()]  # 680x680 rgb_array
@@ -91,7 +119,9 @@ def evaluate(policy, device, n_episodes=EVAL_EPISODES, n_videos=EVAL_VIDEOS):
             image = torch.from_numpy(obs["pixels"]).permute(2, 0, 1)  # HWC -> CHW
             state = torch.from_numpy(obs["agent_pos"]).float()
             actions = policy.inference(
-                image[None].to(device), state[None].to(device)
+                image[None].to(device),
+                state[None].to(device),
+                generator=eval_generator,
             )
             actions = actions.squeeze(0).cpu().numpy()
 
@@ -416,9 +446,15 @@ class DiTPolicy(nn.Module):
         return self.vector_field(x_t, t, image_cond, patch_tokens, obs_cond)
 
     @torch.no_grad()
-    def inference(self, images, obs, n_steps=N_DENOISING_STEPS):
+    def inference(self, images, obs, n_steps=N_DENOISING_STEPS, generator=None):
         batch_size, device = images.shape[0], images.device
-        x = torch.randn(batch_size, PREDICTION_HORIZON, ROBOT_DOF, device=device)
+        x = torch.randn(
+            batch_size,
+            PREDICTION_HORIZON,
+            ROBOT_DOF,
+            device=device,
+            generator=generator,
+        )
         image_cond, patch_tokens, obs_cond = self.encode_observation(images, obs)
 
         dt = 1.0 / n_steps
@@ -445,6 +481,7 @@ def save_checkpoint(policy, optimizer, scheduler, global_step, loss):
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "loss": loss,
+            "seed": SEED,
         },
         checkpoint_path,
     )
@@ -572,6 +609,8 @@ def train(policy, dataloader):
         save_checkpoint(policy, optimizer, scheduler, global_step, last_loss)
 
 def main():
+    seed_everything(SEED)
+
     policy = DiTPolicy()
     dataset = PushTDataset(
         dataset_id=DATASET_ID,
@@ -585,6 +624,8 @@ def main():
         pin_memory=True,
         persistent_workers=NUM_WORKERS > 0,
         prefetch_factor=4 if NUM_WORKERS > 0 else None,
+        worker_init_fn=seed_worker,
+        generator=torch.Generator().manual_seed(SEED),
     )
 
     steps_per_epoch = len(dataloader)
