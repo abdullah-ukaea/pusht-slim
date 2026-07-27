@@ -1,9 +1,24 @@
-torch>=2.4,<3
-torchvision
-huggingface_hub
-pandas
-pyarrow  # pd.read_parquet
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# Core model stack. Keep the matching CUDA 12.4 PyTorch/torchvision pair used
+# by the completed baseline runs.
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
+
+# Dataset loading and video decoding.
+numpy==2.4.4
+pandas==3.0.5
+pyarrow==25.0.0
+huggingface_hub==1.24.0
+av==13.1.0
+
+# PushT training and evaluation environment.
+gymnasium==1.3.0
 gym-pusht==0.1.6
+pygame==2.6.1
 pymunk==6.6.0
-wandb
-moviepy  # wandb.Video mp4 encoding for eval rollout videos
+
+# Experiment tracking and rollout video logging.
+wandb==0.28.1
+moviepy==2.2.1
+pillow==11.3.0
